@@ -9,7 +9,7 @@ Currently provides:
 
 ## Installation
 
-If [available in Hex](https://hex.pm/docs/publish), the package can be installed
+The package can be installed
 by adding `exif_stripper` to your list of dependencies in `mix.exs`:
 
 ```elixir
