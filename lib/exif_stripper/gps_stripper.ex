@@ -6,12 +6,13 @@ defmodule ExifStripper.GpsStripper do
 
   Supported containers:
 
-  - JPEG: clears the GPS IFD pointer in EXIF (APP1)
-  - WebP: clears the GPS IFD pointer in the `EXIF` RIFF chunk
-  - HEIC / other ISO-BMFF images: clears the GPS IFD pointer in the `Exif` item
+  - JPEG: wipes GPS directories and values in EXIF (APP1)
+  - WebP: wipes GPS directories and values in the `EXIF` RIFF chunk
+  - HEIC / other ISO-BMFF images: wipes GPS directories and values in the `Exif` item
   - PNG: removes metadata chunks (`eXIf`, `tEXt`, `zTXt`, `iTXt`)
 
   If no supported metadata is found, returns `:noop` and does not change the output.
+  Malformed or unsafe EXIF metadata returns an error without writing the output.
   """
 
   @gps_ifd_tag 0x8825
@@ -125,15 +126,14 @@ defmodule ExifStripper.GpsStripper do
         {<<>>, after_chunk}
       end
 
-    {chunk_data, patched?} =
-      if chunk_type == "EXIF" do
-        strip_gps_from_exif_payload(chunk_data)
-      else
-        {chunk_data, false}
-      end
-
-    chunk = <<chunk_type::binary-size(4), chunk_size::32-little>> <> chunk_data <> padding
-    strip_webp_chunks(remaining, [chunk | acc], stripped? or patched?)
+    with {:ok, chunk_data, patched?} <-
+           if(chunk_type == "EXIF",
+             do: strip_gps_from_exif_payload(chunk_data),
+             else: {:ok, chunk_data, false}
+           ) do
+      chunk = <<chunk_type::binary-size(4), chunk_size::32-little>> <> chunk_data <> padding
+      strip_webp_chunks(remaining, [chunk | acc], stripped? or patched?)
+    end
   end
 
   defp strip_webp_chunks(_data, _acc, _stripped?), do: {:error, :invalid_webp}
@@ -161,15 +161,14 @@ defmodule ExifStripper.GpsStripper do
     if segment_length >= 2 and byte_size(rest) >= segment_data_len do
       <<segment_data::binary-size(segment_data_len), remaining::binary>> = rest
 
-      {segment_data, patched?} =
-        if marker == @jpg_app1_marker do
-          strip_gps_from_app1_segment(segment_data)
-        else
-          {segment_data, false}
-        end
-
-      segment = <<0xFF, marker, segment_length::16>> <> segment_data
-      strip_jpeg_segments(remaining, [segment | acc], changed? or patched?)
+      with {:ok, segment_data, patched?} <-
+             if(marker == @jpg_app1_marker,
+               do: strip_gps_from_app1_segment(segment_data),
+               else: {:ok, segment_data, false}
+             ) do
+        segment = <<0xFF, marker, segment_length::16>> <> segment_data
+        strip_jpeg_segments(remaining, [segment | acc], changed? or patched?)
+      end
     else
       {:error, :invalid_jpeg}
     end
@@ -178,22 +177,18 @@ defmodule ExifStripper.GpsStripper do
   defp strip_jpeg_segments(<<>>, acc, changed?), do: {:ok, Enum.reverse(acc), changed?}
   defp strip_jpeg_segments(_data, _acc, _changed?), do: {:error, :invalid_jpeg}
 
-  defp strip_gps_from_app1_segment(<<"Exif", 0, 0, tiff::binary>> = segment_data) do
-    case strip_gps_from_tiff(tiff) do
-      {:ok, _tiff, false} -> {segment_data, false}
-      {:ok, new_tiff, true} -> {<<"Exif", 0, 0>> <> new_tiff, true}
-      {:error, _reason} -> {segment_data, false}
+  defp strip_gps_from_app1_segment(<<"Exif", 0, 0, _::binary>> = payload),
+    do: strip_gps_from_exif_payload(payload)
+
+  defp strip_gps_from_app1_segment(payload), do: {:ok, payload, false}
+
+  defp strip_gps_from_exif_payload(<<"Exif", 0, 0, tiff::binary>>) do
+    with {:ok, new_tiff, patched?} <- strip_gps_from_tiff(tiff) do
+      {:ok, <<"Exif", 0, 0>> <> new_tiff, patched?}
     end
   end
 
-  defp strip_gps_from_app1_segment(segment_data), do: {segment_data, false}
-
-  defp strip_gps_from_exif_payload(payload) when is_binary(payload) do
-    case strip_gps_from_tiff(payload) do
-      {:ok, new_tiff, patched?} -> {new_tiff, patched?}
-      {:error, _reason} -> {payload, false}
-    end
-  end
+  defp strip_gps_from_exif_payload(tiff), do: strip_gps_from_tiff(tiff)
 
   defp strip_gps_from_tiff(<<"II", 0x002A::16-little, ifd0_offset::32-little, _::binary>> = tiff) do
     strip_gps_from_ifd0(tiff, ifd0_offset, :little)
@@ -205,57 +200,154 @@ defmodule ExifStripper.GpsStripper do
 
   defp strip_gps_from_tiff(_), do: {:error, :unsupported_tiff}
 
-  defp strip_gps_from_ifd0(tiff, ifd0_offset, endian) do
-    if byte_size(tiff) < ifd0_offset + 2 do
-      {:error, :invalid_ifd0_offset}
+  # First validate and collect ranges, then wipe. Keeping offsets and lengths
+  # unchanged avoids rebuilding TIFF or changing JPEG/WebP/HEIF container tables.
+  defp strip_gps_from_ifd0(tiff, offset, endian) do
+    with {:ok, kept, wiped} <-
+           collect_ifds(tiff, [{offset, :keep}], endian, MapSet.new(), [], []),
+         kept <- merge_ranges(kept),
+         wiped <- merge_ranges(wiped),
+         false <- ranges_overlap?(kept, wiped) do
+      patches = Enum.map(wiped, fn {pos, len} -> {pos, len, :binary.copy(<<0>>, len)} end)
+      {:ok, apply_binary_patches(tiff, patches), wiped != []}
     else
-      <<before_ifd0::binary-size(ifd0_offset), ifd0::binary>> = tiff
-
-      {entry_count, entry_count_bytes, ifd0_entries_and_rest} =
-        case endian do
-          :little ->
-            <<count::16-little, rest::binary>> = ifd0
-            {count, <<count::16-little>>, rest}
-
-          :big ->
-            <<count::16-big, rest::binary>> = ifd0
-            {count, <<count::16-big>>, rest}
-        end
-
-      entries_len = entry_count * 12
-
-      if byte_size(ifd0_entries_and_rest) < entries_len do
-        {:error, :invalid_ifd0}
-      else
-        <<entries::binary-size(entries_len), rest_after_entries::binary>> = ifd0_entries_and_rest
-
-        {patched_entries, patched?} = patch_ifd_entries(entries, endian, false, [])
-
-        new_tiff = before_ifd0 <> entry_count_bytes <> patched_entries <> rest_after_entries
-        {:ok, new_tiff, patched?}
-      end
+      true -> {:error, :overlapping_gps_data}
+      {:error, _} = error -> error
     end
   end
 
-  defp patch_ifd_entries(<<>>, _endian, patched?, acc),
-    do: {IO.iodata_to_binary(Enum.reverse(acc)), patched?}
+  defp collect_ifds(_tiff, [], _endian, _seen, kept, wiped), do: {:ok, [{0, 8} | kept], wiped}
 
-  defp patch_ifd_entries(<<entry::binary-size(12), rest::binary>>, endian, patched?, acc) do
-    tag =
-      case endian do
-        :little ->
-          <<tag::16-little, _::binary-size(10)>> = entry
-          tag
-
-        :big ->
-          <<tag::16-big, _::binary-size(10)>> = entry
-          tag
-      end
-
-    if tag == @gps_ifd_tag do
-      patch_ifd_entries(rest, endian, true, [<<0::size(12)-unit(8)>> | acc])
+  defp collect_ifds(tiff, [{offset, role} | pending], endian, seen, kept, wiped) do
+    with false <- MapSet.member?(seen, offset),
+         {:ok, entries, next, size} <- read_ifd(tiff, offset, endian),
+         {kept, wiped} <-
+           if(role == :wipe,
+             do: {kept, [{offset, size} | wiped]},
+             else: {[{offset, 2}, {offset + size - 4, 4} | kept], wiped}
+           ),
+         pending <- if(next == 0, do: pending, else: [{next, role} | pending]),
+         {:ok, pending, kept, wiped} <-
+           Enum.reduce_while(entries, {:ok, pending, kept, wiped}, fn entry,
+                                                                      {:ok, todo, keep, wipe} ->
+             case collect_entry(tiff, entry, role, endian, todo, keep, wipe) do
+               {:ok, _, _, _} = result -> {:cont, result}
+               {:error, _} = error -> {:halt, error}
+             end
+           end) do
+      collect_ifds(tiff, pending, endian, MapSet.put(seen, offset), kept, wiped)
     else
-      patch_ifd_entries(rest, endian, patched?, [entry | acc])
+      true -> {:error, :cyclic_ifd}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp read_ifd(tiff, offset, endian) do
+    with true <- valid_range?(tiff, offset, 2),
+         count <- read_uint(tiff, offset, 2, endian),
+         size <- 2 + count * 12 + 4,
+         true <- valid_range?(tiff, offset, size) do
+      entries = for i <- indices(count), do: offset + 2 + i * 12
+      {:ok, entries, read_uint(tiff, offset + size - 4, 4, endian), size}
+    else
+      _ -> {:error, :invalid_ifd}
+    end
+  end
+
+  defp collect_entry(tiff, pos, role, endian, pending, kept, wiped) do
+    tag = read_uint(tiff, pos, 2, endian)
+    type = read_uint(tiff, pos + 2, 2, endian)
+    count = read_uint(tiff, pos + 4, 4, endian)
+    value = read_uint(tiff, pos + 8, 4, endian)
+
+    cond do
+      role == :keep and tag == @gps_ifd_tag ->
+        if type == 4 and count == 1 and value >= 8 do
+          {:ok, [{value, :wipe} | pending], kept, [{pos, 12} | wiped]}
+        else
+          {:error, :invalid_gps_pointer}
+        end
+
+      # Entries wiped by a previous invocation are deliberately left as padding.
+      tag == 0 and type == 0 and count == 0 and value == 0 ->
+        kept = if role == :keep, do: [{pos, 12} | kept], else: kept
+        {:ok, pending, kept, wiped}
+
+      true ->
+        with {:ok, width} <- tiff_type_size(type),
+             true <- count > 0,
+             length <- count * width,
+             start <- if(length <= 4, do: pos + 8, else: value),
+             true <- valid_range?(tiff, start, length),
+             {:ok, pending} <-
+               referenced_ifds(tiff, tag, type, count, start, role, endian, pending) do
+          ranges = if length > 4, do: [{start, length}], else: []
+
+          if role == :wipe do
+            {:ok, pending, kept, ranges ++ wiped}
+          else
+            {:ok, pending, [{pos, 12} | ranges ++ kept], wiped}
+          end
+        else
+          _ -> {:error, :invalid_tiff_entry}
+        end
+    end
+  end
+
+  # Follow standard non-GPS subdirectories so their contents cannot accidentally
+  # be wiped through an overlapping GPS value. GPS fields themselves are scalar.
+  defp referenced_ifds(_tiff, _tag, 13, _count, _start, :wipe, _endian, _pending),
+    do: {:error, :unsupported_gps_pointer}
+
+  defp referenced_ifds(tiff, tag, type, count, start, :keep, endian, pending)
+       when tag in [0x8769, 0xA005, 0x014A] or type == 13 do
+    if type in [4, 13] and (tag == 0x014A or type == 13 or count == 1) do
+      offsets = for i <- indices(count), do: {read_uint(tiff, start + i * 4, 4, endian), :keep}
+      {:ok, offsets ++ pending}
+    else
+      {:error, :invalid_ifd_pointer}
+    end
+  end
+
+  defp referenced_ifds(_tiff, _tag, _type, _count, _start, _role, _endian, pending),
+    do: {:ok, pending}
+
+  defp tiff_type_size(type) when type in [1, 2, 6, 7], do: {:ok, 1}
+  defp tiff_type_size(type) when type in [3, 8], do: {:ok, 2}
+  defp tiff_type_size(type) when type in [4, 9, 11, 13], do: {:ok, 4}
+  defp tiff_type_size(type) when type in [5, 10, 12], do: {:ok, 8}
+  defp tiff_type_size(_), do: {:error, :unsupported_tiff_type}
+
+  defp valid_range?(data, offset, length),
+    do: offset >= 8 and length > 0 and offset + length <= byte_size(data)
+
+  defp read_uint(data, offset, bytes, endian),
+    do: data |> binary_part(offset, bytes) |> :binary.decode_unsigned(endian)
+
+  defp indices(0), do: []
+  defp indices(count), do: 0..(count - 1)
+
+  defp merge_ranges(ranges) do
+    ranges
+    |> Enum.sort()
+    |> Enum.reduce([], fn
+      {pos, len}, [{prev, size} | rest] when pos <= prev + size ->
+        [{prev, max(prev + size, pos + len) - prev} | rest]
+
+      range, acc ->
+        [range | acc]
+    end)
+    |> Enum.reverse()
+  end
+
+  defp ranges_overlap?([], _), do: false
+  defp ranges_overlap?(_, []), do: false
+
+  defp ranges_overlap?([{a, alen} | as], [{b, blen} | bs]) do
+    cond do
+      a + alen <= b -> ranges_overlap?(as, [{b, blen} | bs])
+      b + blen <= a -> ranges_overlap?([{a, alen} | as], bs)
+      true -> true
     end
   end
 
@@ -266,7 +358,8 @@ defmodule ExifStripper.GpsStripper do
          {:ok, exif_item_ids} <- isobmff_exif_item_ids(iinf_box),
          {:ok, item_locations} <- isobmff_item_locations(iloc_box),
          exif_locations <- isobmff_pick_items(item_locations, exif_item_ids),
-         {:ok, patches, changed?} <- isobmff_gps_patches(data, exif_locations) do
+         {:ok, patches, changed?} <- isobmff_gps_patches(data, exif_locations),
+         :ok <- validate_disjoint_patches(patches) do
       {:ok, apply_binary_patches(data, patches), changed?}
     else
       {:error, _} = error -> error
@@ -356,40 +449,28 @@ defmodule ExifStripper.GpsStripper do
 
   defp isobmff_exif_item_ids(iinf_box) do
     with {:ok, payload} <- isobmff_box_payload(iinf_box),
-         <<version::8, _flags::24, rest::binary>> <- payload do
-      {item_count, rest} =
-        case version do
-          0 -> decode_u16_be(rest)
-          1 -> decode_u16_be(rest)
-          _ -> decode_u32_be(rest)
-        end
-
-      {ids, _rest} = isobmff_collect_infe_exif_ids(rest, item_count, [])
+         <<version::8, _flags::24, rest::binary>> <- payload,
+         {item_count, rest} <-
+           if(version == 0, do: decode_u16_be(rest), else: decode_u32_be(rest)),
+         {:ok, ids} <- isobmff_collect_infe_exif_ids(rest, item_count, []) do
       {:ok, Enum.reverse(ids)}
     else
       _ -> {:error, :invalid_iinf_box}
     end
+  rescue
+    _ -> {:error, :invalid_iinf_box}
   end
 
-  defp isobmff_collect_infe_exif_ids(rest, 0, acc), do: {acc, rest}
+  defp isobmff_collect_infe_exif_ids(_rest, 0, acc), do: {:ok, acc}
 
   defp isobmff_collect_infe_exif_ids(rest, remaining, acc) do
-    with {:ok, box_type, box_size, _header_size} <- isobmff_box_header(rest),
-         true <- byte_size(rest) >= box_size,
-         <<box::binary-size(box_size), next::binary>> <- rest do
-      acc =
-        if box_type == "infe" do
-          case isobmff_infe_item(box) do
-            {:ok, item_id, "Exif"} -> [item_id | acc]
-            _ -> acc
-          end
-        else
-          acc
-        end
-
+    with {:ok, "infe", box_size, _header_size} <- isobmff_box_header(rest),
+         <<box::binary-size(box_size), next::binary>> <- rest,
+         {:ok, item_id, item_type} <- isobmff_infe_item(box) do
+      acc = if item_type == "Exif", do: [item_id | acc], else: acc
       isobmff_collect_infe_exif_ids(next, remaining - 1, acc)
     else
-      _ -> {acc, rest}
+      _ -> {:error, :invalid_iinf_box}
     end
   end
 
@@ -426,18 +507,13 @@ defmodule ExifStripper.GpsStripper do
   defp isobmff_item_locations(iloc_box) do
     with {:ok, payload} <- isobmff_box_payload(iloc_box),
          <<version::8, _flags::24, rest::binary>> <- payload,
+         true <- version in [0, 1, 2],
          <<offset_and_length_sizes::8, base_and_reserved::8, rest::binary>> <- rest do
       offset_size = div(offset_and_length_sizes, 16)
       length_size = rem(offset_and_length_sizes, 16)
       base_offset_size = div(base_and_reserved, 16)
 
-      {index_size, rest} =
-        if version in [1, 2] do
-          <<index_and_reserved::8, rest::binary>> = rest
-          {div(index_and_reserved, 16), rest}
-        else
-          {0, rest}
-        end
+      index_size = if version in [1, 2], do: rem(base_and_reserved, 16), else: 0
 
       {item_count, rest} =
         if version == 2 do
@@ -462,6 +538,8 @@ defmodule ExifStripper.GpsStripper do
     else
       _ -> {:error, :invalid_iloc}
     end
+  rescue
+    _ -> {:error, :invalid_iloc}
   end
 
   defp isobmff_parse_iloc_items(rest, _version, 0, _os, _ls, _bos, _is, acc), do: {acc, rest}
@@ -485,13 +563,13 @@ defmodule ExifStripper.GpsStripper do
 
     rest =
       if version in [1, 2] do
-        <<_reserved::12, _construction_method::4, rest::binary>> = rest
+        <<_reserved::12, 0::4, rest::binary>> = rest
         rest
       else
         rest
       end
 
-    {_data_reference_index, rest} = decode_u16_be(rest)
+    {0, rest} = decode_u16_be(rest)
 
     {base_offset, rest} = decode_uint_be(rest, base_offset_size)
     {extent_count, rest} = decode_u16_be(rest)
@@ -520,8 +598,6 @@ defmodule ExifStripper.GpsStripper do
       index_size,
       acc
     )
-  rescue
-    _ -> {acc, rest}
   end
 
   defp isobmff_parse_iloc_extents(rest, _version, 0, _os, _ls, _is, _base_offset, acc),
@@ -566,35 +642,45 @@ defmodule ExifStripper.GpsStripper do
   defp isobmff_pick_items(item_locations, ids) when is_map(item_locations) and is_list(ids) do
     ids
     |> Enum.map(fn id -> {id, Map.get(item_locations, id, [])} end)
-    |> Enum.reject(fn {_id, extents} -> extents == [] end)
   end
 
   defp isobmff_gps_patches(_data, []), do: {:ok, [], false}
 
   defp isobmff_gps_patches(data, exif_items) do
-    {patches, changed?} =
-      Enum.reduce(exif_items, {[], false}, fn {_item_id, extents}, {acc, changed?} ->
-        extents = Enum.sort_by(extents, & &1.offset)
-
-        with true <- Enum.all?(extents, &is_map/1),
-             true <-
+    Enum.reduce_while(exif_items, {:ok, [], false}, fn {_item_id, extents},
+                                                       {:ok, acc, changed?} ->
+      with true <-
+             extents != [] and
                Enum.all?(extents, fn %{offset: offset, length: length} ->
-                 length > 0 and byte_size(data) >= offset + length
+                 offset >= 0 and length > 0 and byte_size(data) >= offset + length
                end),
-             exif_item <-
-               Enum.map(extents, fn %{offset: offset, length: length} ->
-                 binary_part(data, offset, length)
-               end),
-             exif_item <- IO.iodata_to_binary(exif_item),
-             {:ok, new_exif_item, true} <- patch_heif_exif_item(exif_item),
-             {:ok, item_patches} <- split_isobmff_item_to_patches(extents, new_exif_item) do
-          {acc ++ item_patches, true}
-        else
-          _ -> {acc, changed?}
-        end
+           exif_item <-
+             Enum.map(extents, fn %{offset: offset, length: length} ->
+               binary_part(data, offset, length)
+             end)
+             |> IO.iodata_to_binary(),
+           {:ok, new_exif_item, patched?} <- patch_heif_exif_item(exif_item),
+           {:ok, item_patches} <- split_isobmff_item_to_patches(extents, new_exif_item) do
+        {:cont, {:ok, acc ++ item_patches, changed? or patched?}}
+      else
+        {:error, _} = error -> {:halt, error}
+        _ -> {:halt, {:error, :invalid_exif_extents}}
+      end
+    end)
+  end
+
+  # Whole-item replacements must never read backwards into unsanitized bytes.
+  # Check all physical ranges together, including aliases across different IDs.
+  defp validate_disjoint_patches(patches) do
+    overlap? =
+      patches
+      |> Enum.sort_by(&elem(&1, 0))
+      |> Enum.chunk_every(2, 1, :discard)
+      |> Enum.any?(fn [{offset, length, _}, {next_offset, _, _}] ->
+        offset + length > next_offset
       end)
 
-    {:ok, patches, changed?}
+    if overlap?, do: {:error, :overlapping_exif_extents}, else: :ok
   end
 
   defp split_isobmff_item_to_patches(extents, new_item) do
