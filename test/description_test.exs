@@ -98,6 +98,72 @@ defmodule ExifStripper.DescriptionTest do
     assert Description.read_file(fixture) == nil
   end
 
+  for ext <- ~w(jpg png),
+      {label, description} <- [{"blank", " \t\n "}, {"oversized", String.duplicate("x", 100)}] do
+    test "falls back to IPTC for #{label} EXIF ImageDescription in #{ext}" do
+      ext = unquote(ext)
+
+      path =
+        Path.join(
+          System.tmp_dir!(),
+          "exif_description_#{System.unique_integer([:positive])}.#{ext}"
+        )
+
+      on_exit(fn -> File.rm(path) end)
+      File.cp!(fixture_path("image_with_caption-abstract.#{ext}"), path)
+
+      {_, 0} =
+        System.cmd("exiftool", [
+          "-overwrite_original",
+          "-EXIF:ImageDescription=#{unquote(description)}",
+          "-IPTC:Caption-Abstract=Short caption",
+          path
+        ])
+
+      assert exiftool_tag(path, "Caption-Abstract") == "Short caption"
+      assert Description.read_file(path, max_length: 20) == "Short caption"
+    end
+  end
+
+  for {ext, fixture, fallback} <- [
+        {"JPEG", "image_with_imagedescription_and_caption-abstract.jpg",
+         :jpeg_iptc_caption_abstract},
+        {"PNG", "image_with_imagedescription_exif.png", :png_iptc_caption_abstract}
+      ] do
+    test "short-circuits IPTC parsing for a valid #{ext} EXIF description" do
+      path = fixture_path(unquote(fixture))
+      expected = exiftool_tag(path, "ImageDescription")
+      parent = self()
+
+      reader =
+        spawn(fn ->
+          receive do
+            :read -> send(parent, {:description, Description.read_file(path)})
+          end
+
+          receive do
+            :done -> :ok
+          end
+        end)
+
+      pattern = {Description, unquote(fallback), 1}
+      Code.ensure_loaded!(Description)
+      assert :erlang.trace_pattern(pattern, true, [:local]) == 1
+      :erlang.trace(reader, true, [:call])
+
+      try do
+        send(reader, :read)
+        assert_receive {:description, ^expected}
+        ref = :erlang.trace_delivered(reader)
+        assert_receive {:trace_delivered, ^reader, ^ref}
+        refute_received {:trace, ^reader, :call, {Description, unquote(fallback), _}}
+      after
+        :erlang.trace_pattern(pattern, false, [:local])
+        send(reader, :done)
+      end
+    end
+  end
+
   test "returns nil when the file can't be read" do
     assert Description.read_file(fixture_path("does-not-exist.jpg")) == nil
   end

@@ -45,42 +45,36 @@ defmodule ExifStripper.Description do
   def read_binary(data, opts \\ []) when is_binary(data) and is_list(opts) do
     data
     |> read_description_from_binary()
-    |> normalize_description(opts)
+    |> Enum.find_value(fn candidate -> normalize_description(candidate.(), opts) end)
   end
 
   defp read_description_from_binary(<<@jpg_soi_marker, _rest::binary>> = data) do
-    case jpeg_image_description(data) do
-      description when is_binary(description) -> description
-      _ -> jpeg_iptc_caption_abstract(data)
-    end
+    [fn -> jpeg_image_description(data) end, fn -> jpeg_iptc_caption_abstract(data) end]
   end
 
   defp read_description_from_binary(<<@png_signature, _rest::binary>> = data) do
-    case png_image_description(data) do
-      description when is_binary(description) -> description
-      _ -> png_iptc_caption_abstract(data)
-    end
+    [fn -> png_image_description(data) end, fn -> png_iptc_caption_abstract(data) end]
   end
 
   defp read_description_from_binary(
          <<@webp_riff_marker, _riff_size::32-little, "WEBP", _rest::binary>> = data
        ) do
-    webp_image_description(data)
+    [fn -> webp_image_description(data) end]
   end
 
   defp read_description_from_binary(<<@gif87a_header, _rest::binary>> = data) do
-    gif_image_description(data)
+    [fn -> gif_image_description(data) end]
   end
 
   defp read_description_from_binary(<<@gif89a_header, _rest::binary>> = data) do
-    gif_image_description(data)
+    [fn -> gif_image_description(data) end]
   end
 
   defp read_description_from_binary(<<_size::32-big, "ftyp", _rest::binary>> = data) do
-    isobmff_image_description(data)
+    [fn -> isobmff_image_description(data) end]
   end
 
-  defp read_description_from_binary(_), do: nil
+  defp read_description_from_binary(_), do: []
 
   defp normalize_description(nil, _opts), do: nil
 
