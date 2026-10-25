@@ -4,7 +4,7 @@ defmodule ExifStripper.MixProject do
   def project do
     [
       app: :exif_stripper,
-      version: "0.1.0",
+      version: "0.1.1",
       elixir: "~> 1.15",
       start_permanent: Mix.env() == :prod,
       description: description(),
@@ -28,7 +28,7 @@ defmodule ExifStripper.MixProject do
   defp package do
     [
       licenses: ["MIT"],
-      files: ~w(lib mix.exs README.md LICENSE),
+      files: ~w(lib mix.exs README.md CHANGELOG.md LICENSE),
       links: %{"Github" => "https://github.com/lambadalambda/exifstripper"}
     ]
   end
