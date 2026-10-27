@@ -61,7 +61,13 @@ defmodule ExifStripper.BoundedReadsTest do
 
     pair = <<0::32, "tEXt", 0::32, 0::32, "abcd", 0::32>>
     signature = <<0x89, "PNG", 0x0D, 0x0A, 0x1A, 0x0A>>
-    png = signature <> :binary.copy(pair, 20_000) <> <<0::32, "IEND", 0::32>>
+    png_with = fn n -> signature <> :binary.copy(pair, n) <> <<0::32, "IEND", 0::32>> end
+    png = png_with.(1000)
+    assert {:error, :too_many_metadata_segments} = GpsStripper.strip_gps_data(png_with.(1100))
+
+    # Many image chunks are fine: only removed metadata chunks are limited.
+    idats = signature <> :binary.copy(<<0::32, "IDAT", 0::32>>, 5000) <> <<0::32, "IEND", 0::32>>
+    assert :noop = GpsStripper.strip_gps_data(idats)
 
     for {name, data} <- [{"many.jpg", jpeg}, {"many.png", png}], in_place? <- [true, false] do
       input = tmp_file(name, data)

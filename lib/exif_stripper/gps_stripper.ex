@@ -56,7 +56,8 @@ defmodule ExifStripper.GpsStripper do
 
   @block_size 65_536
 
-  # Metadata segments (JPEG APP1, WebP EXIF and XMP chunks) per file. Real
+  # Metadata segments (JPEG APP1, WebP EXIF and XMP chunks, removed PNG
+  # metadata chunks) per file. Real
   # files have a few (an Extended XMP packet of the maximum metadata size needs
   # 258); this bounds the work and the patches for hostile files.
   @max_metadata_segments 1024
@@ -117,7 +118,7 @@ defmodule ExifStripper.GpsStripper do
   defp plan(reader) do
     case Reader.peek(reader, 0, 12) do
       {<<@png_signature, _::binary>>, reader} ->
-        png_plan(reader, 8, [{0, 8}], false)
+        png_plan(reader, 8, [{0, 8}], 0)
 
       {<<0xFF, 0xD8, _::binary>>, reader} ->
         patch_plan(jpeg_patches(reader, 2, [], [], 0))
@@ -158,26 +159,31 @@ defmodule ExifStripper.GpsStripper do
   ## PNG
 
   # Walks the chunk headers in `buffer` (the data at `pos`), refilled by blocks.
-  defp png_plan(reader, pos, kept, stripped?),
-    do: png_plan(reader, Reader.size(reader), pos, <<>>, kept, stripped?)
+  # `removed` counts the removed metadata chunks.
+  defp png_plan(reader, pos, kept, removed),
+    do: png_plan(reader, Reader.size(reader), pos, <<>>, kept, removed)
 
-  defp png_plan(reader, size, pos, buffer, kept, stripped?)
+  defp png_plan(_reader, _size, _pos, _buffer, _kept, removed)
+       when removed > @max_metadata_segments,
+       do: {:error, :too_many_metadata_segments}
+
+  defp png_plan(reader, size, pos, buffer, kept, removed)
        when byte_size(buffer) < 12 and pos + byte_size(buffer) < size do
     {buffer, reader} = Reader.peek(reader, pos, @block_size)
-    png_chunk(reader, size, pos, buffer, kept, stripped?)
+    png_chunk(reader, size, pos, buffer, kept, removed)
   end
 
-  defp png_plan(reader, size, pos, buffer, kept, stripped?),
-    do: png_chunk(reader, size, pos, buffer, kept, stripped?)
+  defp png_plan(reader, size, pos, buffer, kept, removed),
+    do: png_chunk(reader, size, pos, buffer, kept, removed)
 
-  defp png_chunk(reader, size, pos, buffer, kept, stripped?) do
+  defp png_chunk(reader, size, pos, buffer, kept, removed) do
     case buffer do
       <<>> ->
-        png_finish(kept, stripped?)
+        png_finish(kept, removed > 0)
 
       # Anything after IEND is not part of the image and may hold metadata: drop it.
       <<0::32, "IEND", _crc::32, _::binary>> ->
-        png_finish(keep(kept, pos, 12), stripped? or pos + 12 < size)
+        png_finish(keep(kept, pos, 12), removed > 0 or pos + 12 < size)
 
       <<length::32, type::binary-size(4), _::binary>> when size - pos >= length + 12 ->
         next = pos + 12 + length
@@ -188,8 +194,8 @@ defmodule ExifStripper.GpsStripper do
             else: <<>>
 
         if png_metadata?(type),
-          do: png_plan(reader, size, next, buffer, kept, true),
-          else: png_plan(reader, size, next, buffer, keep(kept, pos, 12 + length), stripped?)
+          do: png_plan(reader, size, next, buffer, kept, removed + 1),
+          else: png_plan(reader, size, next, buffer, keep(kept, pos, 12 + length), removed)
 
       _ ->
         {:error, :invalid_png}
