@@ -90,6 +90,12 @@ defmodule ExifStripper.GpsStripper do
   defp strip_png_chunks(<<>>, acc, stripped?),
     do: {:ok, IO.iodata_to_binary(Enum.reverse(acc)), stripped?}
 
+  # Anything after IEND is not part of the image and may hold metadata: drop it.
+  defp strip_png_chunks(<<0::32, "IEND", crc::32, rest::binary>>, acc, stripped?) do
+    iend = <<0::32, "IEND", crc::32>>
+    {:ok, IO.iodata_to_binary(Enum.reverse([iend | acc])), stripped? or rest != <<>>}
+  end
+
   defp strip_png_chunks(
          <<chunk_size::32, chunk_type::binary-size(4), chunk_data::binary-size(chunk_size),
            crc::32, rest::binary>>,

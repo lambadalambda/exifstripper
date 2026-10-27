@@ -67,6 +67,24 @@ defmodule ExifStripper.GpsStripperTest do
       assert exiftool_gps_tags(tmp_path) == ""
     end
 
+    test "drops data after the PNG IEND chunk" do
+      trailer = "trailing data after IEND"
+      tmp_path = copy_to_tmp(fixture_path("strip_location_gps.png"))
+      File.write!(tmp_path, File.read!(tmp_path) <> trailer)
+
+      assert :ok = GpsStripper.strip_gps_data(tmp_path, tmp_path)
+      assert exiftool_gps_tags(tmp_path) == ""
+      assert :binary.match(File.read!(tmp_path), trailer) == :nomatch
+
+      tmp_path = copy_to_tmp(fixture_path("image_with_stray_data_after.png"))
+      assert :ok = GpsStripper.strip_gps_data(tmp_path, tmp_path)
+
+      assert String.ends_with?(
+               File.read!(tmp_path),
+               <<0, 0, 0, 0, "IEND", 0xAE, 0x42, 0x60, 0x82>>
+             )
+    end
+
     test "returns :noop for images without GPS metadata" do
       for fixture <- [
             fixture_path("image.jpg"),
