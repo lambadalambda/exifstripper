@@ -94,6 +94,11 @@ defmodule ExifStripper.GpsStripper do
     end
   end
 
+  # BigTIFF uses 64-bit offsets, which the IFD patcher does not handle.
+  defp process_file(<<magic::binary-size(4), _rest::binary>>)
+       when magic in [<<"II", 43, 0>>, <<"MM", 0, 43>>],
+       do: {:error, :unsupported_bigtiff}
+
   defp process_file(_), do: :noop
 
   defp strip_png_chunks(<<>>, acc, stripped?),

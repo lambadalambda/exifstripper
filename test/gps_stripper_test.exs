@@ -85,6 +85,13 @@ defmodule ExifStripper.GpsStripperTest do
              )
     end
 
+    test "refuses BigTIFF files instead of passing them through" do
+      for header <- [<<"II", 43, 0, 8, 0, 0, 0>>, <<"MM", 0, 43, 0, 8, 0, 0>>] do
+        assert {:error, :unsupported_bigtiff} =
+                 GpsStripper.strip_gps_data(header <> :binary.copy(<<0>>, 64))
+      end
+    end
+
     test "returns :noop for images without GPS metadata" do
       for fixture <- [
             fixture_path("image.jpg"),
