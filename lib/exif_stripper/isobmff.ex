@@ -229,6 +229,15 @@ defmodule ExifStripper.ISOBMFF do
     {base_offset, rest} = decode_uint_be(rest, base_offset_size)
     {extent_count, rest} = decode_u16_be(rest)
 
+    # Bound the work by the input size: zero-width extents would otherwise let
+    # a few bytes claim 65535 extents each. Rescued as :invalid_iloc.
+    extent_width = offset_size + length_size + if(version in [1, 2], do: index_size, else: 0)
+
+    if (extent_width == 0 and extent_count > 1) or extent_count * extent_width > byte_size(rest),
+      do: raise(ArgumentError, "iloc extents exceed the box")
+
+    if Map.has_key?(acc, item_id), do: raise(ArgumentError, "duplicate iloc item")
+
     {extents, rest} =
       isobmff_parse_iloc_extents(
         rest,
@@ -247,11 +256,7 @@ defmodule ExifStripper.ISOBMFF do
     location =
       if construction_method == 0 and data_reference_index == 0, do: extents, else: :unsupported
 
-    acc =
-      Map.update(acc, item_id, location, fn
-        existing when is_list(existing) and is_list(location) -> existing ++ location
-        _ -> :unsupported
-      end)
+    acc = Map.put(acc, item_id, location)
 
     isobmff_parse_iloc_items(
       rest,
@@ -305,12 +310,17 @@ defmodule ExifStripper.ISOBMFF do
   end
 
   defp isobmff_pick_items(item_locations, ids) when is_map(item_locations) and is_list(ids) do
-    Enum.reduce_while(ids, {:ok, []}, fn id, {:ok, acc} ->
+    ids
+    |> Enum.reduce_while({:ok, []}, fn id, {:ok, acc} ->
       case Map.get(item_locations, id, []) do
         :unsupported -> {:halt, {:error, :unsupported_exif_location}}
-        extents -> {:cont, {:ok, acc ++ [{id, extents}]}}
+        extents -> {:cont, {:ok, [{id, extents} | acc]}}
       end
     end)
+    |> case do
+      {:ok, items} -> {:ok, Enum.reverse(items)}
+      error -> error
+    end
   end
 
   defp decode_u16_be(<<value::16-big, rest::binary>>), do: {value, rest}

@@ -396,7 +396,7 @@ defmodule ExifStripper.GpsStripper do
              |> IO.iodata_to_binary(),
            {:ok, new_exif_item, patched?} <- patch_heif_exif_item(exif_item),
            {:ok, item_patches} <- split_isobmff_item_to_patches(extents, new_exif_item) do
-        {:cont, {:ok, acc ++ item_patches, changed? or patched?}}
+        {:cont, {:ok, item_patches ++ acc, changed? or patched?}}
       else
         {:error, _} = error -> {:halt, error}
         _ -> {:halt, {:error, :invalid_exif_extents}}
