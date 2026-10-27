@@ -15,7 +15,7 @@ by adding `exif_stripper` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:exif_stripper, "~> 0.1.2"}
+    {:exif_stripper, "~> 0.1.3"}
   ]
 end
 ```
