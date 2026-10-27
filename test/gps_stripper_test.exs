@@ -6,8 +6,8 @@ defmodule ExifStripper.GpsStripperTest do
   alias ExifStripper.GpsStripper
 
   describe "strip_gps_data/2" do
-    test "strips GPS data from JPEG, PNG, WebP and HEIC" do
-      for name <- ~w(jpg png webp heic) |> Enum.map(&"strip_location_gps.#{&1}") do
+    test "strips GPS data from JPEG, PNG, WebP, HEIC and TIFF" do
+      for name <- ~w(jpg png webp heic tiff) |> Enum.map(&"strip_location_gps.#{&1}") do
         fixture = fixture_path(name)
         tmp_path = copy_to_tmp(fixture)
 

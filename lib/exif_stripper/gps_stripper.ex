@@ -85,6 +85,15 @@ defmodule ExifStripper.GpsStripper do
     end
   end
 
+  defp process_file(<<magic::binary-size(4), _rest::binary>> = data)
+       when magic in [<<"II", 42, 0>>, <<"MM", 0, 42>>] do
+    case strip_gps_from_tiff(data) do
+      {:ok, new_data, true} -> {:ok, new_data}
+      {:ok, _new_data, false} -> :noop
+      {:error, _} = error -> error
+    end
+  end
+
   defp process_file(_), do: :noop
 
   defp strip_png_chunks(<<>>, acc, stripped?),
