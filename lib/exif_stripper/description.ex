@@ -16,12 +16,14 @@ defmodule ExifStripper.Description do
   - PNG
   - WebP (EXIF chunk)
   - HEIC / other ISO-BMFF images (Exif item)
+  - TIFF (IFD0 `ImageDescription`, IPTC tag 33723; BigTIFF is not read)
   - GIF (XMP)
   """
 
   alias ExifStripper.ISOBMFF
 
   @image_description_exif_tag 0x010E
+  @iptc_tiff_tag 0x83BB
 
   @iptc_marker 0x1C
   @iptc_caption_record 0x02
@@ -76,6 +78,11 @@ defmodule ExifStripper.Description do
     [fn -> isobmff_image_description(data) end]
   end
 
+  defp read_description_from_binary(<<magic::binary-size(4), _rest::binary>> = data)
+       when magic in [<<"II", 42, 0>>, <<"MM", 0, 42>>] do
+    [fn -> tiff_image_description(data) end, fn -> tiff_iptc_caption_abstract(data) end]
+  end
+
   defp read_description_from_binary(_), do: []
 
   defp normalize_description(nil, _opts), do: nil
@@ -120,6 +127,20 @@ defmodule ExifStripper.Description do
     data
     |> jpeg_find_app13_photoshop()
     |> photoshop_irb_caption_abstract()
+  rescue
+    _ -> nil
+  end
+
+  defp tiff_image_description(data) do
+    exif_ascii_tag(data, @image_description_exif_tag)
+  rescue
+    _ -> nil
+  end
+
+  defp tiff_iptc_caption_abstract(data) do
+    data
+    |> exif_tag_bytes(@iptc_tiff_tag)
+    |> iptc_caption_abstract()
   rescue
     _ -> nil
   end
@@ -445,19 +466,43 @@ defmodule ExifStripper.Description do
     end
   end
 
-  defp exif_ascii_tag(nil, _tag), do: nil
+  defp exif_ascii_tag(tiff, tag) do
+    case exif_ifd0_entry(tiff, tag, [2]) do
+      {_type, count, offset, inline} ->
+        with value when is_binary(value) <- exif_value(tiff, count, offset, inline),
+             do: :binary.replace(value, <<0>>, <<>>, [:global])
 
-  defp exif_ascii_tag(<<"II", 0x002A::16-little, ifd0_offset::32-little, _::binary>> = tiff, tag) do
-    exif_ifd0_ascii_tag(tiff, ifd0_offset, :little, tag)
+      nil ->
+        nil
+    end
   end
 
-  defp exif_ascii_tag(<<"MM", 0x002A::16-big, ifd0_offset::32-big, _::binary>> = tiff, tag) do
-    exif_ifd0_ascii_tag(tiff, ifd0_offset, :big, tag)
+  # The value bytes of a BYTE, UNDEFINED or LONG tag.
+  defp exif_tag_bytes(tiff, tag) do
+    case exif_ifd0_entry(tiff, tag, [1, 4, 7]) do
+      {type, count, offset, inline} ->
+        exif_value(tiff, count * if(type == 4, do: 4, else: 1), offset, inline)
+
+      nil ->
+        nil
+    end
   end
 
-  defp exif_ascii_tag(_, _tag), do: nil
+  # Returns {type, count, value, inline_bytes} of the first IFD0 entry with
+  # the tag and one of the types.
+  defp exif_ifd0_entry(
+         <<"II", 0x002A::16-little, ifd0::32-little, _::binary>> = tiff,
+         tag,
+         types
+       ),
+       do: exif_ifd0_entry(tiff, ifd0, :little, tag, types)
 
-  defp exif_ifd0_ascii_tag(tiff, ifd0_offset, endian, tag)
+  defp exif_ifd0_entry(<<"MM", 0x002A::16-big, ifd0::32-big, _::binary>> = tiff, tag, types),
+    do: exif_ifd0_entry(tiff, ifd0, :big, tag, types)
+
+  defp exif_ifd0_entry(_tiff, _tag, _types), do: nil
+
+  defp exif_ifd0_entry(tiff, ifd0_offset, endian, tag, types)
        when byte_size(tiff) >= ifd0_offset + 2 do
     <<_::binary-size(ifd0_offset), ifd0::binary>> = tiff
     {entry_count, rest} = exif_decode_u16(ifd0, endian)
@@ -467,51 +512,33 @@ defmodule ExifStripper.Description do
       nil
     else
       <<entries::binary-size(entries_len), _::binary>> = rest
-      exif_entries_ascii_tag(entries, endian, tiff, tag)
+      exif_entries_find(entries, endian, tag, types)
     end
   end
 
-  defp exif_ifd0_ascii_tag(_tiff, _ifd0_offset, _endian, _tag), do: nil
+  defp exif_ifd0_entry(_tiff, _ifd0_offset, _endian, _tag, _types), do: nil
 
-  defp exif_entries_ascii_tag(<<>>, _endian, _tiff, _tag), do: nil
+  defp exif_entries_find(<<>>, _endian, _tag, _types), do: nil
 
-  defp exif_entries_ascii_tag(<<entry::binary-size(12), rest::binary>>, endian, tiff, tag) do
-    {entry_tag, entry_type, entry_count, entry_value, entry_value_bytes} =
-      case endian do
-        :little ->
-          <<entry_tag::16-little, entry_type::16-little, entry_count::32-little,
-            entry_value_bytes::binary-size(4)>> = entry
+  defp exif_entries_find(<<entry::binary-size(12), rest::binary>>, endian, tag, types) do
+    <<entry_tag::binary-size(2), type::binary-size(2), count::binary-size(4),
+      inline::binary-size(4)>> = entry
 
-          entry_value = :binary.decode_unsigned(entry_value_bytes, :little)
-          {entry_tag, entry_type, entry_count, entry_value, entry_value_bytes}
+    [entry_tag, type, count, value] =
+      Enum.map([entry_tag, type, count, inline], &:binary.decode_unsigned(&1, endian))
 
-        :big ->
-          <<entry_tag::16-big, entry_type::16-big, entry_count::32-big,
-            entry_value_bytes::binary-size(4)>> = entry
-
-          entry_value = :binary.decode_unsigned(entry_value_bytes, :big)
-          {entry_tag, entry_type, entry_count, entry_value, entry_value_bytes}
-      end
-
-    if entry_tag == tag and entry_type == 2 do
-      exif_ascii_value(tiff, entry_count, entry_value, entry_value_bytes)
-    else
-      exif_entries_ascii_tag(rest, endian, tiff, tag)
-    end
+    if entry_tag == tag and type in types,
+      do: {type, count, value, inline},
+      else: exif_entries_find(rest, endian, tag, types)
   end
 
-  defp exif_ascii_value(_tiff, 0, _offset, _inline), do: nil
+  defp exif_value(_tiff, 0, _offset, _inline), do: nil
 
-  defp exif_ascii_value(_tiff, count, _offset, inline) when count <= 4 do
-    inline |> binary_part(0, count) |> :binary.replace(<<0>>, <<>>, [:global])
-  end
+  defp exif_value(_tiff, length, _offset, inline) when length <= 4,
+    do: binary_part(inline, 0, length)
 
-  defp exif_ascii_value(tiff, count, offset, _inline) do
-    if byte_size(tiff) >= offset + count do
-      tiff |> binary_part(offset, count) |> :binary.replace(<<0>>, <<>>, [:global])
-    else
-      nil
-    end
+  defp exif_value(tiff, length, offset, _inline) do
+    if byte_size(tiff) >= offset + length, do: binary_part(tiff, offset, length), else: nil
   end
 
   defp exif_decode_u16(<<value::16-little, rest::binary>>, :little), do: {value, rest}

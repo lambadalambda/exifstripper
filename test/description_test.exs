@@ -50,6 +50,33 @@ defmodule ExifStripper.DescriptionTest do
     assert Description.read_file(fixture) == expected
   end
 
+  test "reads ImageDescription and the IPTC fallback from TIFF files" do
+    for {name, tag} <- [
+          {"image_with_imagedescription.tiff", "ImageDescription"},
+          {"image_with_caption-abstract.tiff", "Caption-Abstract"}
+        ] do
+      fixture = fixture_path(name)
+      expected = exiftool_tag(fixture, tag)
+      assert is_binary(expected)
+
+      assert Description.read_file(fixture) == expected
+    end
+
+    assert Description.read_file(fixture_path("strip_location_gps.tiff")) == nil
+  end
+
+  test "returns nil for BigTIFF and truncated TIFF files" do
+    data = File.read!(fixture_path("image_with_imagedescription.tiff"))
+
+    for broken <- [
+          <<"II", 43, 0, 8, 0, 0, 0>> <> binary_part(data, 8, byte_size(data) - 8),
+          binary_part(data, 0, 12),
+          <<"MM", 0, 42, 0xFF, 0xFF, 0xFF, 0xFF>>
+        ] do
+      assert Description.read_binary(broken) == nil
+    end
+  end
+
   test "reads iptc:Caption-Abstract from PNG zTXt profile" do
     fixture = fixture_path("image_with_caption-abstract.png")
     expected = exiftool_tag(fixture, "Caption-Abstract")
