@@ -37,6 +37,45 @@ defmodule ExifStripper.BoundedReadsTest do
     assert Enum.sum(reads) < byte_size(expected) + 300_000
   end
 
+  # 0.1.2 handled these in memory; the path API must not need one system call
+  # per small segment, chunk or patch.
+  test "uses few file operations for many small segments, chunks and patches" do
+    exif =
+      "Exif\0\0" <>
+        <<"II", 42::16-little, 8::32-little, 1::16-little, 0x8825::16-little, 4::16-little,
+          1::32-little, 26::32-little, 0::32-little, 1::16-little, 1::16-little, 2::16-little,
+          2::32-little, "N\0", 0::16, 0::32>>
+
+    segment = <<0xFF, 0xE1, byte_size(exif) + 2::16>> <> exif
+    jpeg = <<0xFF, 0xD8>> <> :binary.copy(segment, 1000) <> <<0xFF, 0xDA, 0, 2, 0xFF, 0xD9>>
+
+    too_many =
+      <<0xFF, 0xD8>> <> :binary.copy(segment, 1100) <> <<0xFF, 0xDA, 0, 2, 0xFF, 0xD9>>
+
+    assert {:error, :too_many_metadata_segments} = GpsStripper.strip_gps_data(too_many)
+
+    chunk = "EXIF" <> <<byte_size(exif)::32-little>> <> exif
+    webp = fn n -> "RIFF" <> <<0::32>> <> "WEBP" <> :binary.copy(chunk, n) end
+    assert {:ok, _} = GpsStripper.strip_gps_data(webp.(1000))
+    assert {:error, :too_many_metadata_segments} = GpsStripper.strip_gps_data(webp.(1100))
+
+    pair = <<0::32, "tEXt", 0::32, 0::32, "abcd", 0::32>>
+    signature = <<0x89, "PNG", 0x0D, 0x0A, 0x1A, 0x0A>>
+    png = signature <> :binary.copy(pair, 20_000) <> <<0::32, "IEND", 0::32>>
+
+    for {name, data} <- [{"many.jpg", jpeg}, {"many.png", png}], in_place? <- [true, false] do
+      input = tmp_file(name, data)
+      output = if in_place?, do: input, else: input <> ".out"
+      on_exit(fn -> File.rm(input <> ".out") end)
+      assert {:ok, expected} = GpsStripper.strip_gps_data(data)
+
+      {result, calls} = traced_calls(fn -> GpsStripper.strip_gps_data(input, output) end)
+      assert result == :ok
+      assert File.read!(output) == expected
+      assert operations(calls) < 100, "#{name}: #{operations(calls)} file operations"
+    end
+  end
+
   defp large(:jpg) do
     jpeg = fixture("strip_location_gps.jpg")
     # Entropy-coded data after SOS, before EOI.
@@ -74,7 +113,37 @@ defmodule ExifStripper.BoundedReadsTest do
   # Returns the sizes of all file reads made by `fun`. A read of a whole file
   # counts as its size.
   defp traced_reads(fun) do
-    patterns = [{:file, :pread, 3}, {:file, :read, 2}, {:file, :read_file, 1}]
+    {result, calls} = traced_calls(fun)
+
+    reads =
+      for call <- calls, size = read_size(call), size != nil, do: size
+
+    {result, reads}
+  end
+
+  defp read_size({:pread, [_fd, _pos, size]}), do: size
+  defp read_size({:read, [_fd, size]}), do: size
+  defp read_size({:read_file, [path]}), do: File.stat!(path).size
+  defp read_size(_call), do: nil
+
+  # File operations: reads, writes, and each element of a pwrite list.
+  defp operations(calls) do
+    Enum.sum(
+      for call <- calls do
+        case call do
+          {:pwrite, [_fd, list]} -> length(list)
+          _ -> 1
+        end
+      end
+    )
+  end
+
+  # Returns the :file calls made by `fun` as {function, args}.
+  defp traced_calls(fun) do
+    patterns =
+      [{:pread, 3}, {:read, 2}, {:read_file, 1}, {:pwrite, 2}, {:pwrite, 3}, {:write, 2}]
+      |> Enum.map(fn {f, a} -> {:file, f, a} end)
+
     Enum.each(patterns, &:erlang.trace_pattern(&1, true, [:global]))
 
     # A process cannot trace itself: run `fun` in a traced task.
@@ -97,21 +166,14 @@ defmodule ExifStripper.BoundedReadsTest do
 
     ref = :erlang.trace_delivered(task.pid)
     assert_receive {:trace_delivered, _, ^ref}
-    {result, collect_reads([])}
+    {result, collect_calls([])}
   end
 
-  defp collect_reads(acc) do
+  defp collect_calls(acc) do
     receive do
-      {:trace, _, :call, {:file, :pread, [_fd, _pos, size]}} ->
-        collect_reads([size | acc])
-
-      {:trace, _, :call, {:file, :read, [_fd, size]}} ->
-        collect_reads([size | acc])
-
-      {:trace, _, :call, {:file, :read_file, [path]}} ->
-        collect_reads([File.stat!(path).size | acc])
+      {:trace, _, :call, {:file, function, args}} -> collect_calls([{function, args} | acc])
     after
-      0 -> acc
+      0 -> Enum.reverse(acc)
     end
   end
 

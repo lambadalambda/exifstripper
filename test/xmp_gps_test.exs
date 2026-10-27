@@ -144,6 +144,14 @@ defmodule ExifStripper.XmpGpsTest do
     end
   end
 
+  test "refuses JPEG files with too many Extended XMP chunks" do
+    guid = String.duplicate("A", 32)
+    empty = extension_segment(guid, 0, 0, "")
+
+    assert {:error, :too_many_metadata_segments} =
+             GpsStripper.strip_gps_data(jpeg(List.duplicate(empty, 1100)))
+  end
+
   test "fails closed on malformed XMP in WebP, HEIC and TIFF" do
     for ext <- ~w(webp heic tiff) do
       data = File.read!(fixture("xmp_gps.#{ext}"))

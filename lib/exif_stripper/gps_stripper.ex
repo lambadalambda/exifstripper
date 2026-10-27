@@ -52,7 +52,12 @@ defmodule ExifStripper.GpsStripper do
   @xmp_header "http://ns.adobe.com/xap/1.0/\0"
   @extended_xmp_header "http://ns.adobe.com/xmp/extension/\0"
 
-  @copy_block_size 65_536
+  @block_size 65_536
+
+  # Metadata segments (JPEG APP1, WebP EXIF and XMP chunks) per file. Real
+  # files have a few (an Extended XMP packet of the maximum metadata size needs
+  # 258); this bounds the work and the patches for hostile files.
+  @max_metadata_segments 1024
 
   @type result :: :ok | :noop | {:error, term()}
 
@@ -113,10 +118,10 @@ defmodule ExifStripper.GpsStripper do
         png_plan(reader, 8, [{0, 8}], false)
 
       {<<0xFF, 0xD8, _::binary>>, reader} ->
-        patch_plan(jpeg_patches(reader, 2, [], []))
+        patch_plan(jpeg_patches(reader, 2, [], [], 0))
 
       {<<"RIFF", _size::32, "WEBP">>, reader} ->
-        patch_plan(webp_patches(reader, 12, []))
+        patch_plan(webp_patches(reader, 12, [], 0))
 
       {<<_size::32, "ftyp", _::binary>>, reader} ->
         patch_plan(isobmff_patches(reader))
@@ -150,26 +155,47 @@ defmodule ExifStripper.GpsStripper do
 
   ## PNG
 
-  defp png_plan(reader, pos, kept, stripped?) do
-    size = Reader.size(reader)
+  # Walks the chunk headers in `buffer` (the data at `pos`), refilled by blocks.
+  defp png_plan(reader, pos, kept, stripped?),
+    do: png_plan(reader, Reader.size(reader), pos, <<>>, kept, stripped?)
 
-    case Reader.peek(reader, pos, 12) do
-      {<<>>, _reader} ->
+  defp png_plan(reader, size, pos, buffer, kept, stripped?)
+       when byte_size(buffer) < 12 and pos + byte_size(buffer) < size do
+    {buffer, reader} = Reader.peek(reader, pos, @block_size)
+    png_chunk(reader, size, pos, buffer, kept, stripped?)
+  end
+
+  defp png_plan(reader, size, pos, buffer, kept, stripped?),
+    do: png_chunk(reader, size, pos, buffer, kept, stripped?)
+
+  defp png_chunk(reader, size, pos, buffer, kept, stripped?) do
+    case buffer do
+      <<>> ->
         png_finish(kept, stripped?)
 
       # Anything after IEND is not part of the image and may hold metadata: drop it.
-      {<<0::32, "IEND", _crc::32>>, _reader} ->
+      <<0::32, "IEND", _crc::32, _::binary>> ->
         png_finish(keep(kept, pos, 12), stripped? or pos + 12 < size)
 
-      {<<length::32, type::binary-size(4), _::binary>>, reader} when size - pos >= length + 12 ->
-        if type in @png_metadata_chunks,
-          do: png_plan(reader, pos + 12 + length, kept, true),
-          else: png_plan(reader, pos + 12 + length, keep(kept, pos, 12 + length), stripped?)
+      <<length::32, type::binary-size(4), _::binary>> when size - pos >= length + 12 ->
+        next = pos + 12 + length
+
+        buffer =
+          if byte_size(buffer) >= 12 + length,
+            do: binary_part(buffer, 12 + length, byte_size(buffer) - 12 - length),
+            else: <<>>
+
+        if png_metadata?(type),
+          do: png_plan(reader, size, next, buffer, kept, true),
+          else: png_plan(reader, size, next, buffer, keep(kept, pos, 12 + length), stripped?)
 
       _ ->
         {:error, :invalid_png}
     end
   end
+
+  for type <- @png_metadata_chunks, do: defp(png_metadata?(unquote(type)), do: true)
+  defp png_metadata?(_type), do: false
 
   # Kept ranges, newest first; adjacent ranges are merged.
   defp keep([{start, length} | rest], pos, add) when start + length == pos,
@@ -183,7 +209,11 @@ defmodule ExifStripper.GpsStripper do
   ## JPEG
 
   # Extended XMP chunks are collected, then patched once all are known.
-  defp jpeg_patches(reader, pos, acc, extended) do
+  defp jpeg_patches(_reader, _pos, _acc, _extended, segments)
+       when segments > @max_metadata_segments,
+       do: {:error, :too_many_metadata_segments}
+
+  defp jpeg_patches(reader, pos, acc, extended, segments) do
     case Reader.peek(reader, pos, 4) do
       {<<>>, _reader} ->
         extended_xmp_patches(reader, extended, acc)
@@ -192,26 +222,47 @@ defmodule ExifStripper.GpsStripper do
         extended_xmp_patches(reader, extended, acc)
 
       {<<0xFF, 0xFF, _::binary>>, reader} ->
-        jpeg_patches(reader, pos + 1, acc, extended)
+        jpeg_patches(reader, pos + 1, acc, extended, segments)
 
       {<<0xFF, marker, _::binary>>, reader}
       when marker == @jpg_tem_marker or marker in 0xD0..0xD9 ->
-        jpeg_patches(reader, pos + 2, acc, extended)
+        jpeg_patches(reader, pos + 2, acc, extended, segments)
 
       {<<0xFF, marker, length::16>>, reader} when length >= 2 ->
         start = pos + 4
         next = start + length - 2
+        segments = if marker == @jpg_app1_marker, do: segments + 1, else: segments
 
-        with {:ok, segment} <- slice(reader, start, length - 2, :invalid_jpeg) do
+        with {:ok, segment, reader} <- jpeg_segment_reader(reader, marker, start, length - 2) do
           case jpeg_segment(marker, segment) do
-            {:ok, patches} -> jpeg_patches(reader, next, shift(patches, start) ++ acc, extended)
-            {:extended, chunk} -> jpeg_patches(reader, next, acc, [{start, chunk} | extended])
-            error -> error
+            {:ok, patches} ->
+              jpeg_patches(reader, next, shift(patches, start) ++ acc, extended, segments)
+
+            {:extended, chunk} ->
+              jpeg_patches(reader, next, acc, [{start, chunk} | extended], segments)
+
+            error ->
+              error
           end
         end
 
       _ ->
         {:error, :invalid_jpeg}
+    end
+  end
+
+  # APP1 segments (at most 64 KiB) are read into memory through the block cache.
+  defp jpeg_segment_reader(reader, marker, start, length) do
+    cond do
+      start + length > Reader.size(reader) ->
+        {:error, :invalid_jpeg}
+
+      marker == @jpg_app1_marker ->
+        {bytes, reader} = Reader.peek(reader, start, length)
+        {:ok, Reader.from_binary(bytes), reader}
+
+      true ->
+        {:ok, nil, reader}
     end
   end
 
@@ -287,7 +338,10 @@ defmodule ExifStripper.GpsStripper do
 
   ## WebP
 
-  defp webp_patches(reader, pos, acc) do
+  defp webp_patches(_reader, _pos, _acc, segments) when segments > @max_metadata_segments,
+    do: {:error, :too_many_metadata_segments}
+
+  defp webp_patches(reader, pos, acc, segments) do
     remaining = Reader.size(reader) - pos
 
     case Reader.peek(reader, pos, 8) do
@@ -296,11 +350,22 @@ defmodule ExifStripper.GpsStripper do
 
       {<<type::binary-size(4), length::32-little>>, reader} when remaining - 8 >= length ->
         start = pos + 8
-        {:ok, chunk} = Reader.slice(reader, start, length)
         padding = if rem(length, 2) == 1 and remaining - 8 > length, do: 1, else: 0
 
+        # Small metadata chunks are read into memory through the block cache.
+        {chunk, reader} =
+          if type in ["EXIF", "XMP "] and length <= @block_size do
+            {bytes, reader} = Reader.peek(reader, start, length)
+            {Reader.from_binary(bytes), reader}
+          else
+            {:ok, chunk} = Reader.slice(reader, start, length)
+            {chunk, reader}
+          end
+
+        segments = if type in ["EXIF", "XMP "], do: segments + 1, else: segments
+
         with {:ok, patches} <- webp_chunk_patches(type, chunk) do
-          webp_patches(reader, start + length + padding, shift(patches, start) ++ acc)
+          webp_patches(reader, start + length + padding, shift(patches, start) ++ acc, segments)
         end
 
       _ ->
@@ -418,10 +483,6 @@ defmodule ExifStripper.GpsStripper do
 
   ## Helpers
 
-  defp slice(reader, offset, length, error) do
-    with {:error, _} <- Reader.slice(reader, offset, length), do: {:error, error}
-  end
-
   defp overlapping?(ranges) do
     ranges
     |> Enum.sort()
@@ -452,8 +513,74 @@ defmodule ExifStripper.GpsStripper do
     end
   end
 
-  defp patch_in_place(patches, path),
-    do: with_file(path, [:read, :write], fn fd, _size -> pwrite(fd, patches) end)
+  # Patches close to each other are applied with one read and one write per
+  # block, instead of one write per patch.
+  defp patch_in_place(patches, path) do
+    with_file(path, [:read, :write], fn fd, size ->
+      reader = Reader.from_file(fd, size)
+
+      writes =
+        patches
+        |> group_patches()
+        |> Enum.map(fn
+          [single] ->
+            {:ok, single}
+
+          [{start, _} | _] = group ->
+            {last, bytes} = List.last(group)
+
+            with {:ok, block} <- Reader.read(reader, start, last + byte_size(bytes) - start) do
+              {data, []} = patch_block(block, start, group)
+              {:ok, {start, IO.iodata_to_binary(data)}}
+            end
+        end)
+
+      case Enum.find(writes, &match?({:error, _}, &1)) do
+        nil -> pwrite(fd, Enum.map(writes, &elem(&1, 1)))
+        error -> error
+      end
+    end)
+  end
+
+  defp group_patches(patches) do
+    patches
+    |> Enum.chunk_while(
+      [],
+      fn
+        patch, [] ->
+          {:cont, [patch]}
+
+        {pos, bytes} = patch, [{start, _} | _] = group ->
+          if pos + byte_size(bytes) - start <= @block_size,
+            do: {:cont, [patch | group]},
+            else: {:cont, Enum.reverse(group), [patch]}
+      end,
+      fn
+        [] -> {:cont, []}
+        group -> {:cont, Enum.reverse(group), []}
+      end
+    )
+  end
+
+  # Applies the sorted patches that start inside `block` (at offset `offset`).
+  # Returns the patched block as iodata and the patches (or remainders of
+  # patches) after it.
+  defp patch_block(block, offset, patches, acc \\ [], cursor \\ nil)
+
+  defp patch_block(block, offset, [{pos, bytes} | rest], acc, cursor)
+       when pos < offset + byte_size(block) do
+    cursor = cursor || offset
+    take = min(byte_size(bytes), offset + byte_size(block) - pos)
+    <<part::binary-size(take), remainder::binary>> = bytes
+    acc = [acc, binary_part(block, cursor - offset, pos - cursor), part]
+    rest = if remainder == <<>>, do: rest, else: [{pos + take, remainder} | rest]
+    patch_block(block, offset, rest, acc, pos + take)
+  end
+
+  defp patch_block(block, offset, patches, acc, cursor) do
+    cursor = cursor || offset
+    {[acc, binary_part(block, cursor - offset, offset + byte_size(block) - cursor)], patches}
+  end
 
   defp pwrite(_fd, []), do: :ok
 
@@ -487,8 +614,7 @@ defmodule ExifStripper.GpsStripper do
 
     with {:ok, out} <- :file.open(tmp_path, [:raw, :binary, :write, :exclusive]) do
       try do
-        with :ok <- copy_ranges(reader, out, ranges),
-             :ok <- pwrite(out, patches),
+        with :ok <- copy_ranges(reader, out, ranges, patches),
              :ok <- :file.close(out),
              {:ok, %{mode: mode}} <- File.stat(input_path),
              :ok <- File.chmod(tmp_path, mode &&& 0o777) do
@@ -501,23 +627,27 @@ defmodule ExifStripper.GpsStripper do
     end
   end
 
-  defp copy_ranges(reader, out, ranges) do
-    Enum.reduce_while(ranges, :ok, fn {offset, length}, :ok ->
-      case copy_range(reader, out, offset, length) do
-        :ok -> {:cont, :ok}
-        error -> {:halt, error}
-      end
-    end)
-  end
+  # Copies the ranges in blocks, applying the patches (in input offsets), and
+  # writes through a buffer of about one block.
+  defp copy_ranges(reader, out, ranges, patches),
+    do: copy_ranges(reader, out, ranges, patches, [], 0)
 
-  defp copy_range(_reader, _out, _offset, 0), do: :ok
+  defp copy_ranges(_reader, out, [], _patches, buffer, _buffered), do: :file.write(out, buffer)
 
-  defp copy_range(reader, out, offset, length) do
-    block = min(length, @copy_block_size)
+  defp copy_ranges(reader, out, [{_offset, 0} | ranges], patches, buffer, buffered),
+    do: copy_ranges(reader, out, ranges, patches, buffer, buffered)
 
-    with {:ok, bytes} <- Reader.read(reader, offset, block),
-         :ok <- :file.write(out, bytes) do
-      copy_range(reader, out, offset + block, length - block)
+  defp copy_ranges(reader, out, [{offset, length} | ranges], patches, buffer, buffered) do
+    block = min(length, @block_size)
+    {bytes, reader} = Reader.peek(reader, offset, block)
+    {data, patches} = patch_block(bytes, offset, patches)
+    ranges = [{offset + block, length - block} | ranges]
+
+    if buffered + block >= @block_size do
+      with :ok <- :file.write(out, [buffer, data]),
+           do: copy_ranges(reader, out, ranges, patches, [], 0)
+    else
+      copy_ranges(reader, out, ranges, patches, [buffer, data], buffered + block)
     end
   end
 end
