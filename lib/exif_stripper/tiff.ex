@@ -12,6 +12,10 @@ defmodule ExifStripper.TIFF do
   @gps_ifd_tag 0x8825
   @xmp_tag 700
 
+  # IFDs (IFD0, next IFDs, SubIFDs, Exif, GPS, ...) followed per TIFF structure.
+  # Bounds time and memory on hostile files; above it, the file is refused.
+  @max_ifds 1024
+
   @type patch :: {non_neg_integer(), binary()}
 
   @doc "Returns patches sorted by offset, relative to the reader. `[]` means no GPS data."
@@ -28,7 +32,7 @@ defmodule ExifStripper.TIFF do
   # so wiped GPS data cannot overlap them.
   defp gps_patches(reader, offset, endian) do
     with {:ok, kept, wiped, xmp} <-
-           collect_ifds(reader, [{offset, :keep}], endian, MapSet.new(), [], [], []),
+           collect_ifds(reader, {1, [{offset, :keep}]}, endian, MapSet.new(), [], [], []),
          kept <- merge_ranges(kept),
          wiped <- merge_ranges(wiped),
          false <- ranges_overlap?(kept, wiped),
@@ -63,10 +67,12 @@ defmodule ExifStripper.TIFF do
     end
   end
 
-  defp collect_ifds(_reader, [], _endian, _seen, kept, wiped, xmp),
+  # `pending` is {queued, offsets}: IFDs still to read, and how many IFDs were
+  # queued in total.
+  defp collect_ifds(_reader, {_queued, []}, _endian, _seen, kept, wiped, xmp),
     do: {:ok, [{0, 8} | kept], wiped, xmp}
 
-  defp collect_ifds(reader, [{offset, role} | pending], endian, seen, kept, wiped, xmp) do
+  defp collect_ifds(reader, {queued, [{offset, role} | rest]}, endian, seen, kept, wiped, xmp) do
     with false <- MapSet.member?(seen, offset),
          {:ok, entries, next, size} <- read_ifd(reader, offset, endian),
          {kept, wiped} <-
@@ -74,7 +80,8 @@ defmodule ExifStripper.TIFF do
              do: {kept, [{offset, size} | wiped]},
              else: {[{offset, 2}, {offset + size - 4, 4} | kept], wiped}
            ),
-         pending <- if(next == 0, do: pending, else: [{next, role} | pending]),
+         {:ok, pending} <-
+           if(next == 0, do: {:ok, {queued, rest}}, else: enqueue({queued, rest}, [{next, role}])),
          {:ok, {pending, kept, wiped, xmp}} <-
            Enum.reduce_while(entries, {:ok, {pending, kept, wiped, xmp}}, fn entry, {:ok, acc} ->
              case collect_entry(reader, entry, role, endian, acc) do
@@ -113,7 +120,8 @@ defmodule ExifStripper.TIFF do
     cond do
       role == :keep and tag == @gps_ifd_tag ->
         if type == 4 and count == 1 and value >= 8 do
-          {:ok, {[{value, :wipe} | pending], kept, [{pos, 12} | wiped], xmp}}
+          with {:ok, pending} <- enqueue(pending, [{value, :wipe}]),
+               do: {:ok, {pending, kept, [{pos, 12} | wiped], xmp}}
         else
           {:error, :invalid_gps_pointer}
         end
@@ -140,23 +148,31 @@ defmodule ExifStripper.TIFF do
             {:ok, {pending, [{pos, 12} | ranges ++ kept], wiped, xmp}}
           end
         else
+          {:error, :too_many_ifds} = error -> error
           _ -> {:error, :invalid_tiff_entry}
         end
     end
   end
+
+  defp enqueue({queued, _}, offsets) when queued + length(offsets) > @max_ifds,
+    do: {:error, :too_many_ifds}
+
+  defp enqueue({queued, pending}, offsets),
+    do: {:ok, {queued + length(offsets), offsets ++ pending}}
 
   # Follow standard non-GPS subdirectories so their contents cannot accidentally
   # be wiped through an overlapping GPS value. GPS fields themselves are scalar.
   defp referenced_ifds(_reader, _tag, 13, _count, _start, :wipe, _endian, _pending),
     do: {:error, :unsupported_gps_pointer}
 
-  defp referenced_ifds(reader, tag, type, count, start, :keep, endian, pending)
+  defp referenced_ifds(reader, tag, type, count, start, :keep, endian, {queued, _} = pending)
        when tag in [0x8769, 0xA005, 0x014A] or type == 13 do
     with true <- type in [4, 13] and (tag == 0x014A or type == 13 or count == 1),
+         true <- queued + count <= @max_ifds || {:error, :too_many_ifds},
          {:ok, values} <- Reader.read(reader, start, count * 4) do
-      offsets = for <<value::binary-size(4) <- values>>, do: {decode_uint(value, endian), :keep}
-      {:ok, offsets ++ pending}
+      enqueue(pending, for(<<v::binary-size(4) <- values>>, do: {decode_uint(v, endian), :keep}))
     else
+      {:error, :too_many_ifds} = error -> error
       _ -> {:error, :invalid_ifd_pointer}
     end
   end

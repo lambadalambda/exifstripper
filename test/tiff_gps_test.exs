@@ -73,6 +73,44 @@ defmodule ExifStripper.TiffGpsTest do
     end
   end
 
+  test "refuses TIFF files with too many IFDs or SubIFD pointers" do
+    # A chain of `n` empty IFDs.
+    chain = fn n ->
+      ifds =
+        for i <- 0..(n - 1),
+            into: <<>>,
+            do: <<0::16-little, if(i == n - 1, do: 0, else: 8 + (i + 1) * 6)::32-little>>
+
+      <<"II", 42::16-little, 8::32-little>> <> ifds
+    end
+
+    # IFD0 with a SubIFDs entry pointing at `n` distinct empty IFDs.
+    subifds = fn n ->
+      first = 26 + n * 4
+      pointers = for i <- 0..(n - 1), into: <<>>, do: <<first + i * 6::32-little>>
+
+      <<"II", 42::16-little, 8::32-little, 1::16-little, 0x014A::16-little, 4::16-little,
+        n::32-little, 26::32-little,
+        0::32-little>> <>
+        pointers <> :binary.copy(<<0::16, 0::32>>, n)
+    end
+
+    assert :noop = GpsStripper.strip_gps_data(chain.(1000))
+    assert {:error, :too_many_ifds} = GpsStripper.strip_gps_data(chain.(1100))
+    assert :noop = GpsStripper.strip_gps_data(subifds.(1000))
+    assert {:error, :too_many_ifds} = GpsStripper.strip_gps_data(subifds.(1100))
+
+    # Millions of pointers fail before they are read.
+    huge =
+      <<"II", 42::16-little, 8::32-little, 1::16-little, 0x014A::16-little, 4::16-little,
+        4_000_000::32-little, 26::32-little,
+        0::32-little>> <> :binary.copy(<<8::32-little>>, 4_000_000)
+
+    {micros, result} = :timer.tc(fn -> GpsStripper.strip_gps_data(huge) end)
+    assert {:error, :too_many_ifds} = result
+    assert micros < 2_000_000
+  end
+
   test "handles HEIC file-offset item locations in versions 1 and 2; rejects other methods" do
     {tiff, clean, _} = gps_tiff(:big)
 
