@@ -32,10 +32,12 @@ defmodule ExifStripper.GpsStripper do
 
   `strip_gps_data/2` reads only the metadata, not the image data. When input
   and output are the same file, JPEG, WebP, ISO-BMFF and TIFF files are patched
-  in place. In all other cases, the result is written to a temporary file next
-  to the output, which then replaces the output (this needs write access to the
-  output directory). Metadata that must be loaded into memory is limited to
-  16 MiB; larger metadata returns `{:error, :metadata_too_large}`.
+  in place (through symlinks and hard links). In all other cases, the result is
+  written to a temporary file next to the output, which then replaces the output
+  path (this needs write access to the output directory). Metadata that must be
+  loaded into memory is limited to 16 MiB; larger metadata returns
+  `{:error, :metadata_too_large}`. Hostile structures (too many IFDs, metadata
+  segments or XMP elements) also return errors.
   """
 
   import Bitwise, only: [<<<: 2, &&&: 2, |||: 2]

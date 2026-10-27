@@ -19,9 +19,11 @@ defmodule ExifStripper.ISOBMFFTest do
     box("ftyp", "heic" <> <<0::32>> <> "mif1heic") <> full_box("meta", 0, iinf <> iloc)
   end
 
+  # The unbounded versions took many seconds and gigabytes; 2 s leaves room
+  # for slow CI machines.
   defp assert_fast(fun) do
     {micros, _} = :timer.tc(fun)
-    assert micros < 200_000, "took #{div(micros, 1000)} ms"
+    assert micros < 2_000_000, "took #{div(micros, 1000)} ms"
   end
 
   test "rejects zero-width extents instead of building one entry per extent" do

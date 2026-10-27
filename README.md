@@ -28,7 +28,10 @@ Strip GPS metadata in-place (returns `:ok`, `:noop` or `{:error, reason}`):
 ExifStripper.GpsStripper.strip_gps_data("/tmp/in.jpg", "/tmp/in.jpg")
 ```
 
-Malformed metadata returns an error and leaves the output unchanged.
+Malformed metadata returns an error and leaves the output unchanged. When input
+and output are the same file, JPEG, WebP, HEIC and TIFF files are patched in
+place (through symlinks and hard links). PNG files and other outputs are written
+to a temporary file next to the output, which then replaces the output path.
 
 Read a description:
 
