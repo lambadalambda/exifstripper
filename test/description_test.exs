@@ -74,6 +74,11 @@ defmodule ExifStripper.DescriptionTest do
     assert Description.read_file(fixture) == expected
   end
 
+  test "reads ImageDescription from a gridded HEIC (iloc version 1)" do
+    assert Description.read_file(fixture_path("image_with_imagedescription_grid.heic")) ==
+             "Grid description"
+  end
+
   test "reads ImageDescription from GIF XMP" do
     fixture = fixture_path("image_with_imagedescription_xmp.gif")
     expected = exiftool_tag(fixture, "ImageDescription")

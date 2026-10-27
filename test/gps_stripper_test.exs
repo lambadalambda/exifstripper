@@ -7,8 +7,8 @@ defmodule ExifStripper.GpsStripperTest do
 
   describe "strip_gps_data/2" do
     test "strips GPS data from JPEG, PNG, WebP and HEIC" do
-      for ext <- ~w(jpg png webp heic) do
-        fixture = fixture_path("strip_location_gps.#{ext}")
+      for name <- ~w(jpg png webp heic) |> Enum.map(&"strip_location_gps.#{&1}") do
+        fixture = fixture_path(name)
         tmp_path = copy_to_tmp(fixture)
 
         assert exiftool_gps_tags(tmp_path) != ""
@@ -59,12 +59,21 @@ defmodule ExifStripper.GpsStripperTest do
       end
     end
 
+    test "strips GPS data from a gridded HEIC (iloc items with construction method 1)" do
+      tmp_path = copy_to_tmp(fixture_path("strip_location_gps_grid.heic"))
+
+      assert exiftool_gps_tags(tmp_path) != ""
+      assert :ok = GpsStripper.strip_gps_data(tmp_path, tmp_path)
+      assert exiftool_gps_tags(tmp_path) == ""
+    end
+
     test "returns :noop for images without GPS metadata" do
       for fixture <- [
             fixture_path("image.jpg"),
             fixture_path("image.png"),
             fixture_path("image.webp"),
-            fixture_path("image.heic")
+            fixture_path("image.heic"),
+            fixture_path("image_grid.heic")
           ] do
         original = File.read!(fixture)
         tmp_path = copy_to_tmp(fixture)
