@@ -13,25 +13,26 @@ defmodule ExifStripper.ISOBMFF do
   @spec exif_item_locations(binary()) ::
           {:ok, [{non_neg_integer(), extents()}]} | {:error, term()}
   def exif_item_locations(data) when is_binary(data) do
-    with {:ok, items} <- metadata_item_locations(Reader.from_binary(data)),
+    with {:ok, items} <- metadata_item_locations(Reader.from_binary(data), [:exif]),
          do: {:ok, for({:exif, id, extents} <- items, do: {id, extents})}
   end
 
   @doc """
-  Returns the file extents of every Exif and XMP (`application/rdf+xml`) item.
-  Fails closed on malformed boxes, on metadata items that are not stored at
-  plain file offsets, and on encoded XMP items. Only the top-level box headers
-  and the `meta` box are read.
+  Returns the file extents of every Exif and/or XMP (`application/rdf+xml`)
+  item. Fails closed on malformed boxes, and on wanted items that are not
+  stored at plain file offsets or are encoded XMP. Only the top-level box
+  headers and the `meta` box are read.
   """
-  @spec metadata_item_locations(Reader.t()) ::
+  @spec metadata_item_locations(Reader.t(), [:exif | :xmp]) ::
           {:ok, [{:exif | :xmp, non_neg_integer(), extents()}]} | {:error, term()}
-  def metadata_item_locations(%Reader{} = reader) do
+  def metadata_item_locations(%Reader{} = reader, kinds) do
     with {:ok, meta_payload} <- isobmff_find_meta_payload(reader),
          {:ok, iinf_box} <- isobmff_find_child_box(meta_payload, "iinf"),
          {:ok, iloc_box} <- isobmff_find_child_box(meta_payload, "iloc"),
          {:ok, metadata_items} <- isobmff_metadata_items(iinf_box),
          {:ok, item_locations} <- isobmff_item_locations(iloc_box) do
-      isobmff_pick_items(item_locations, metadata_items)
+      wanted = Enum.filter(metadata_items, fn {kind, _id} -> base_kind(kind) in kinds end)
+      isobmff_pick_items(item_locations, wanted)
     end
   end
 
@@ -191,6 +192,9 @@ defmodule ExifStripper.ISOBMFF do
   end
 
   defp metadata_kind(_type, _fields), do: nil
+
+  defp base_kind(:encoded_xmp), do: :xmp
+  defp base_kind(kind), do: kind
 
   defp isobmff_item_locations(iloc_box) do
     with {:ok, payload} <- isobmff_box_payload(iloc_box),

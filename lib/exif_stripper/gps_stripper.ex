@@ -307,7 +307,7 @@ defmodule ExifStripper.GpsStripper do
   ## ISO-BMFF
 
   defp isobmff_patches(reader) do
-    with {:ok, items} <- ISOBMFF.metadata_item_locations(reader),
+    with {:ok, items} <- ISOBMFF.metadata_item_locations(reader, [:exif, :xmp]),
          :ok <- validate_extents(reader, items) do
       Enum.reduce_while(items, {:ok, []}, fn {kind, _id, extents}, {:ok, acc} ->
         with {:ok, item} <- read_extents(reader, extents),

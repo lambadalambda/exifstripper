@@ -59,6 +59,13 @@ defmodule ExifStripper.ISOBMFFTest do
     assert {:error, :metadata_too_large} = GpsStripper.strip_gps_data(data)
   end
 
+  test "Exif item lookups ignore unsupported XMP items" do
+    mime = <<1::16, 0::16, "mime", 0, "application/rdf+xml", 0, "deflate", 0>>
+    data = heif(<<0x44, 0, 1::16, 1::16, 0::16, 0::16, 1::16, 0::32, 1::32>>, mime)
+
+    assert {:ok, []} = ISOBMFF.exif_item_locations(data)
+  end
+
   test "refuses encoded XMP items and XMP items outside plain file offsets" do
     xmp = "<x:xmpmeta xmlns:x='adobe:ns:meta/'/>"
 
