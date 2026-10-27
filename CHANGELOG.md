@@ -4,7 +4,7 @@
 
 ### Added
 
-- Strip GPS properties from XMP: JPEG (XMP and Extended XMP segments), WebP (`XMP ` chunk), HEIC/AVIF (`application/rdf+xml` items) and TIFF (tag 700). GPS properties are the elements and attributes in the EXIF namespace whose names start with `GPS`. They are overwritten with spaces, so offsets do not change and the XMP stays well-formed. XMP that cannot be scanned safely (DTDs, unbalanced tags, UTF-16, encoded HEIC items, incomplete Extended XMP) returns an error, so files that passed before can now fail. PNG files already lost their XMP with the `iTXt` chunk.
+- Strip GPS properties from XMP: JPEG (XMP and Extended XMP segments, and other APP1 segments that exiftool reads as XMP), WebP (`XMP ` chunk), HEIC/AVIF (`application/rdf+xml` items) and TIFF (tag 700). GPS properties are the elements and attributes in the EXIF namespace whose names start with `GPS`. They are overwritten with spaces, so offsets do not change and the XMP stays well-formed. XMP that cannot be scanned safely (DTDs, unbalanced tags, UTF-16, encoded HEIC items, incomplete Extended XMP) returns an error, so files that passed before can now fail. PNG files already lost their XMP with the `iTXt` chunk.
 - `Description` reads TIFF files: IFD0 `ImageDescription`, with the IPTC caption (tag 33723) as fallback. BigTIFF files return `nil`.
 
 ### Changed

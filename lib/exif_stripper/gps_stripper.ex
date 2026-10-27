@@ -7,7 +7,7 @@ defmodule ExifStripper.GpsStripper do
   Supported containers:
 
   - JPEG: wipes GPS directories and values in EXIF (APP1), and GPS properties
-    in XMP and Extended XMP (APP1)
+    in XMP, Extended XMP and other APP1 segments that look like XMP
   - WebP: wipes GPS directories and values in the `EXIF` chunk, and GPS
     properties in the `XMP ` chunk
   - HEIC / other ISO-BMFF images: wipes GPS directories and values in the
