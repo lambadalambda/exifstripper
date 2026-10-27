@@ -68,6 +68,55 @@ defmodule ExifStripper.PathApiTest do
     assert File.read!(output) == "previous output"
   end
 
+  test "patches in place when both paths name the same file differently" do
+    for name <- ~w(strip_location_gps.jpg strip_location_gps.png) do
+      data = File.read!(fixture(name))
+      path = tmp_file(name, data)
+      other = Path.join([Path.dirname(path), ".", Path.basename(path)])
+      assert {:ok, expected} = GpsStripper.strip_gps_data(data)
+
+      assert :ok = GpsStripper.strip_gps_data(path, other)
+      assert File.read!(path) == expected
+    end
+  end
+
+  test "keeps the file mode when a PNG is rewritten" do
+    path = tmp_file("mode.png", File.read!(fixture("strip_location_gps.png")))
+    File.chmod!(path, 0o640)
+
+    assert :ok = GpsStripper.strip_gps_data(path, path)
+    assert Bitwise.band(File.stat!(path).mode, 0o777) == 0o640
+    assert Path.wildcard(Path.join(Path.dirname(path), ".*mode.png*.tmp")) == []
+  end
+
+  test "keeps JPEG fill bytes before markers" do
+    <<0xFF, 0xD8, rest::binary>> = File.read!(fixture("strip_location_gps.jpg"))
+    data = <<0xFF, 0xD8, 0xFF, 0xFF>> <> rest
+    path = tmp_file("fill.jpg", data)
+
+    assert {:ok, <<0xFF, 0xD8, 0xFF, 0xFF, _::binary>> = stripped} =
+             GpsStripper.strip_gps_data(data)
+
+    assert byte_size(stripped) == byte_size(data)
+    assert :ok = GpsStripper.strip_gps_data(path, path)
+    assert File.read!(path) == stripped
+  end
+
+  test "writes a separate output atomically, without leaving temporary files" do
+    for name <- ~w(strip_location_gps.jpg strip_location_gps.png) do
+      dir = tmp_path("dir")
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf(dir) end)
+      input = tmp_file(name, File.read!(fixture(name)))
+      output = Path.join(dir, "out")
+      File.write!(output, "previous")
+
+      assert :ok = GpsStripper.strip_gps_data(input, output)
+      assert {:ok, File.read!(output)} == GpsStripper.strip_gps_data(File.read!(input))
+      assert File.ls!(dir) == ["out"]
+    end
+  end
+
   test "returns an error for a missing input file" do
     assert {:error, _} = GpsStripper.strip_gps_data(tmp_path("missing.jpg"), tmp_path("out"))
   end

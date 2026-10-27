@@ -5,15 +5,21 @@ defmodule ExifStripper.ISOBMFF do
   # Shared ISO Base Media File Format (HEIC, AVIF) parsing: finds the Exif
   # items and where they are stored in the file.
 
+  alias ExifStripper.Reader
+
   @doc """
   Returns the file extents of every Exif item. Fails closed on malformed
-  boxes, and on Exif items that are not stored at plain file offsets.
+  boxes, and on Exif items that are not stored at plain file offsets. Only
+  the top-level box headers and the `meta` box are read.
   """
-  @spec exif_item_locations(binary()) ::
+  @spec exif_item_locations(binary() | Reader.t()) ::
           {:ok, [{non_neg_integer(), [%{offset: integer(), length: integer()}]}]}
           | {:error, term()}
-  def exif_item_locations(data) when is_binary(data) do
-    with {:ok, meta_payload} <- isobmff_find_meta_payload(data),
+  def exif_item_locations(data) when is_binary(data),
+    do: exif_item_locations(Reader.from_binary(data))
+
+  def exif_item_locations(%Reader{} = reader) do
+    with {:ok, meta_payload} <- isobmff_find_meta_payload(reader),
          {:ok, iinf_box} <- isobmff_find_child_box(meta_payload, "iinf"),
          {:ok, iloc_box} <- isobmff_find_child_box(meta_payload, "iloc"),
          {:ok, exif_item_ids} <- isobmff_exif_item_ids(iinf_box),
@@ -22,8 +28,8 @@ defmodule ExifStripper.ISOBMFF do
     end
   end
 
-  defp isobmff_find_meta_payload(data) do
-    case isobmff_find_top_box(data, "meta") do
+  defp isobmff_find_meta_payload(reader) do
+    case find_top_box(reader, 0, "meta") do
       {:ok, meta_box} ->
         with {:ok, payload} <- isobmff_box_payload(meta_box),
              <<_version::8, _flags::24, rest::binary>> <- payload do
@@ -32,29 +38,30 @@ defmodule ExifStripper.ISOBMFF do
           _ -> {:error, :invalid_meta_box}
         end
 
+      {:error, :metadata_too_large} = error ->
+        error
+
       _ ->
         {:error, :no_meta_box}
     end
   end
 
-  defp isobmff_find_top_box(data, wanted_type) do
-    do_isobmff_find_top_box(data, wanted_type)
-  end
+  defp find_top_box(reader, pos, wanted_type) do
+    case Reader.peek(reader, pos, 16) do
+      {<<>>, _reader} ->
+        {:error, :not_found}
 
-  defp do_isobmff_find_top_box(<<>>, _wanted_type), do: {:error, :not_found}
-
-  defp do_isobmff_find_top_box(data, wanted_type) when is_binary(data) do
-    with {:ok, box_type, box_size, _header_size} <- isobmff_box_header(data),
-         true <- byte_size(data) >= box_size do
-      <<box::binary-size(box_size), rest::binary>> = data
-
-      if box_type == wanted_type do
-        {:ok, box}
-      else
-        do_isobmff_find_top_box(rest, wanted_type)
-      end
-    else
-      _ -> {:error, :invalid_isobmff}
+      {header, reader} ->
+        with {:ok, box_type, box_size, _header_size} <- isobmff_box_header(header),
+             true <- Reader.size(reader) - pos >= box_size do
+          cond do
+            box_type != wanted_type -> find_top_box(reader, pos + box_size, wanted_type)
+            box_size > Reader.max_metadata_size() -> {:error, :metadata_too_large}
+            true -> Reader.read(reader, pos, box_size)
+          end
+        else
+          _ -> {:error, :invalid_isobmff}
+        end
     end
   end
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.3 (unreleased)
+
+### Changed
+
+- `strip_gps_data/2` no longer reads the whole file into memory. It reads only the metadata, and patches the file in place when input and output are the same file. Peak memory for a 20 MB JPEG or PNG went from 40-60 MB to about 1 MB. PNG files, and outputs that are other files, are written to a temporary file next to the output and then renamed over it, so this needs write access to the output directory.
+- Metadata that must be loaded into memory (ISO-BMFF `meta` boxes and Exif items) is limited to 16 MiB. Larger metadata returns `{:error, :metadata_too_large}`.
+- JPEG fill bytes (`FF FF`) before a marker are kept. Before, one byte per pair was dropped.
+
 ## 0.1.2
 
 ### Added

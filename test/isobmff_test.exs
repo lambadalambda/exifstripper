@@ -48,4 +48,13 @@ defmodule ExifStripper.ISOBMFFTest do
 
     assert_fast(fn -> assert {:error, _} = ISOBMFF.exif_item_locations(data) end)
   end
+
+  test "refuses Exif items larger than the metadata limit instead of loading them" do
+    size = 17 * 1024 * 1024
+    offset = byte_size(heif(<<0x44, 0, 1::16, 1::16, 0::16, 0::16, 1::16, 0::32, 0::32>>))
+    data = heif(<<0x44, 0, 1::16, 1::16, 0::16, 0::16, 1::16, offset::32, size::32>>)
+    data = data <> :binary.copy(<<0>>, size)
+
+    assert {:error, :metadata_too_large} = GpsStripper.strip_gps_data(data)
+  end
 end
