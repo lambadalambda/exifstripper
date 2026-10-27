@@ -14,7 +14,7 @@ defmodule ExifStripper.TIFF do
 
   @type patch :: {non_neg_integer(), binary()}
 
-  @doc "Returns zero-filling patches, relative to the reader. `[]` means no GPS data."
+  @doc "Returns patches sorted by offset, relative to the reader. `[]` means no GPS data."
   @spec gps_patches(Reader.t()) :: {:ok, [patch()]} | {:error, term()}
   def gps_patches(reader) do
     case Reader.read(reader, 0, 8) do
@@ -33,7 +33,8 @@ defmodule ExifStripper.TIFF do
          wiped <- merge_ranges(wiped),
          false <- ranges_overlap?(kept, wiped),
          {:ok, xmp_patches} <- xmp_patches(reader, xmp) do
-      {:ok, Enum.map(wiped, fn {pos, len} -> {pos, :binary.copy(<<0>>, len)} end) ++ xmp_patches}
+      wipes = Enum.map(wiped, fn {pos, len} -> {pos, :binary.copy(<<0>>, len)} end)
+      {:ok, Enum.sort_by(wipes ++ xmp_patches, &elem(&1, 0))}
     else
       true -> {:error, :overlapping_gps_data}
       {:error, _} = error -> error

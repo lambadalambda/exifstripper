@@ -54,6 +54,16 @@ defmodule ExifStripper.XmpGpsTest do
     assert tags =~ "Title"
   end
 
+  test "patches HEIC Exif items split into reordered extents" do
+    tiff = File.read!(fixture("xmp_gps.tiff"))
+    assert {:ok, clean} = GpsStripper.strip_gps_data(tiff)
+
+    # The XMP (tag 700) is in the first extent, the GPS directory in the second.
+    assert {:ok, result} = GpsStripper.strip_gps_data(heic_split(tiff, 4000))
+    assert result == heic_split(clean, 4000)
+    refute result =~ "GPSLatitude"
+  end
+
   test "fails closed on malformed XMP and incomplete Extended XMP" do
     extended = packet("<exif:GPSLatitude>1</exif:GPSLatitude>")
     guid = String.duplicate("A", 32)
@@ -126,6 +136,26 @@ defmodule ExifStripper.XmpGpsTest do
       extension_segment(guid, byte_size(packet), from, binary_part(packet, from, to - from))
     end)
   end
+
+  # A HEIC whose Exif item is stored as two extents, second part first.
+  defp heic_split(tiff, cut) do
+    item = <<0::32>> <> tiff
+    <<first::binary-size(cut), second::binary>> = item
+    infe = box("infe", <<2, 0::24, 1::16, 0::16, "Exif", 0>>)
+    iinf = box("iinf", <<0::32, 1::16>> <> infe)
+
+    meta = fn base ->
+      extents = <<base + byte_size(second)::32, cut::32, base::32, byte_size(second)::32>>
+      iloc = box("iloc", <<0::32, 0x44, 0, 1::16, 1::16, 0::16, 2::16>> <> extents)
+      box("meta", <<0::32>> <> iinf <> iloc)
+    end
+
+    ftyp = box("ftyp", "heic" <> <<0::32>> <> "mif1heic")
+    base = byte_size(ftyp) + byte_size(meta.(0)) + 8
+    ftyp <> meta.(base) <> box("mdat", second <> first)
+  end
+
+  defp box(type, data), do: <<byte_size(data) + 8::32>> <> type <> data
 
   defp xmp_tags(path), do: exiftool(["-a", "-G1", "-xmp:all", "-warning", "--XMPToolkit", path])
 
