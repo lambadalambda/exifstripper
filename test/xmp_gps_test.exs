@@ -64,6 +64,21 @@ defmodule ExifStripper.XmpGpsTest do
     refute result =~ "GPSLatitude"
   end
 
+  test "blanks GPS properties in APP1 XMP with non-standard headers" do
+    body = packet("<exif:GPSLatitude>48,48.0N</exif:GPSLatitude><dc:title>Keep</dc:title>")
+
+    for payload <- ["XMP\0" <> body, "http://ns.adobe.com/xap/1.0/ " <> body, body] do
+      path = tmp_file(jpeg([app1(payload)]))
+      assert xmp_tags(path) =~ "GPS Latitude"
+
+      assert :ok = GpsStripper.strip_gps_data(path, path)
+      refute xmp_tags(path) =~ "GPS"
+      assert xmp_tags(path) =~ "Keep"
+    end
+
+    assert {:error, _} = GpsStripper.strip_gps_data(jpeg([app1("XMP\0<?xpacket <x>")]))
+  end
+
   test "fails closed on malformed XMP and incomplete Extended XMP" do
     extended = packet("<exif:GPSLatitude>1</exif:GPSLatitude>")
     guid = String.duplicate("A", 32)

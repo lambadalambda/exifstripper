@@ -137,12 +137,9 @@ defmodule ExifStripper.GpsStripper do
   defp patch_plan({:ok, patches}) do
     patches = Enum.sort_by(patches, &elem(&1, 0))
 
-    overlap? =
-      patches
-      |> Enum.chunk_every(2, 1, :discard)
-      |> Enum.any?(fn [{pos, bytes}, {next, _}] -> pos + byte_size(bytes) > next end)
-
-    if overlap?, do: {:error, :overlapping_patches}, else: {:patch, patches}
+    if overlapping?(for {pos, bytes} <- patches, do: {pos, byte_size(bytes)}),
+      do: {:error, :overlapping_patches},
+      else: {:patch, patches}
   end
 
   defp patch_plan({:error, _} = error), do: error
@@ -229,12 +226,31 @@ defmodule ExifStripper.GpsStripper do
       {<<@extended_xmp_header, _::binary>>, _} ->
         {:error, :invalid_extended_xmp}
 
-      _ ->
-        {:ok, []}
+      {header, _} ->
+        other_app1_patches(segment, header)
     end
   end
 
   defp jpeg_segment(_marker, _segment), do: {:ok, []}
+
+  # exiftool also reads APP1 segments as XMP if they start with `http` or
+  # `XMP\0`, or contain `<exif:` or `<?xpacket`. Scan those from the first `<`.
+  defp other_app1_patches(segment, header) do
+    {:ok, data} = Reader.read(segment, 0, Reader.size(segment))
+
+    xmp? =
+      match?(<<"http", _::binary>>, header) or match?(<<"XMP", 0, _::binary>>, header) or
+        :binary.match(data, ["<exif:", "<?xpacket"]) != :nomatch
+
+    case xmp? && :binary.match(data, "<") do
+      {start, 1} ->
+        with {:ok, patches} <- XMP.gps_patches(binary_part(data, start, byte_size(data) - start)),
+             do: {:ok, shift(patches, start)}
+
+      _ ->
+        {:ok, []}
+    end
+  end
 
   # Each Extended XMP packet (by GUID) must be complete: chunks of one size,
   # without gaps or overlaps. Patches are mapped back onto the chunks.
@@ -330,16 +346,15 @@ defmodule ExifStripper.GpsStripper do
       Enum.all?(items, fn {_kind, _id, extents} -> extents != [] end) and
         Enum.all?(extents, fn %{offset: o, length: l} -> o >= 0 and l > 0 and o + l <= size end)
 
-    overlap? =
-      extents
-      |> Enum.sort_by(& &1.offset)
-      |> Enum.chunk_every(2, 1, :discard)
-      |> Enum.any?(fn [a, b] -> a.offset + a.length > b.offset end)
-
     cond do
-      not valid? -> {:error, :invalid_exif_extents}
-      overlap? -> {:error, :overlapping_exif_extents}
-      true -> :ok
+      not valid? ->
+        {:error, :invalid_exif_extents}
+
+      overlapping?(for e <- extents, do: {e.offset, e.length}) ->
+        {:error, :overlapping_exif_extents}
+
+      true ->
+        :ok
     end
   end
 
@@ -401,6 +416,13 @@ defmodule ExifStripper.GpsStripper do
 
   defp slice(reader, offset, length, error) do
     with {:error, _} <- Reader.slice(reader, offset, length), do: {:error, error}
+  end
+
+  defp overlapping?(ranges) do
+    ranges
+    |> Enum.sort()
+    |> Enum.chunk_every(2, 1, :discard)
+    |> Enum.any?(fn [{pos, length}, {next, _}] -> pos + length > next end)
   end
 
   defp shift(patches, by), do: Enum.map(patches, fn {pos, bytes} -> {pos + by, bytes} end)
