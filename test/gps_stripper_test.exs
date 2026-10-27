@@ -85,6 +85,27 @@ defmodule ExifStripper.GpsStripperTest do
              )
     end
 
+    test "strips GPS data behind Exif header variants that exiftool reads" do
+      <<0xFF, 0xD8, rest::binary>> = File.read!(fixture_path("strip_location_gps.jpg"))
+      {pos, _} = :binary.match(rest, "Exif\0\0")
+      <<before::binary-size(pos - 4), 0xFF, 0xE1, _length::16, "Exif\0\0", tail::binary>> = rest
+
+      # The TIFF data runs to the end of the APP1 segment.
+      <<_::binary-size(pos - 4), 0xFF, 0xE1, length::16, _::binary>> = rest
+      <<tiff::binary-size(length - 8), after_segment::binary>> = tail
+
+      for header <- ["Exif\0\xFF", "ExiF\0\0", "EXIF\0\0", "abcdExif\0\0", "\0\0Exif\0\0"] do
+        payload = header <> tiff
+        segment = <<0xFF, 0xE1, byte_size(payload) + 2::16>> <> payload
+        path = copy_to_tmp(fixture_path("strip_location_gps.jpg"))
+        File.write!(path, <<0xFF, 0xD8>> <> before <> segment <> after_segment)
+        assert exiftool_gps_tags(path) =~ "GPS Latitude", inspect(header)
+
+        assert :ok = GpsStripper.strip_gps_data(path, path)
+        assert exiftool_gps_tags(path) == "", inspect(header)
+      end
+    end
+
     test "refuses BigTIFF files instead of passing them through" do
       for header <- [<<"II", 43, 0, 8, 0, 0, 0>>, <<"MM", 0, 43, 0, 8, 0, 0>>] do
         assert {:error, :unsupported_bigtiff} =

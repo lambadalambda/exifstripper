@@ -38,7 +38,7 @@ defmodule ExifStripper.GpsStripper do
   16 MiB; larger metadata returns `{:error, :metadata_too_large}`.
   """
 
-  import Bitwise, only: [<<<: 2, &&&: 2]
+  import Bitwise, only: [<<<: 2, &&&: 2, |||: 2]
 
   alias ExifStripper.{ISOBMFF, Reader, TIFF, XMP}
 
@@ -267,26 +267,48 @@ defmodule ExifStripper.GpsStripper do
   end
 
   defp jpeg_segment(@jpg_app1_marker, segment) do
-    case Reader.peek(segment, 0, 75) do
-      {<<"Exif", 0, 0, _::binary>>, _} ->
-        exif_payload_patches(segment)
+    {header, _} = Reader.peek(segment, 0, 75)
 
-      {<<@xmp_header, _::binary>>, _} ->
-        {:ok, packet} = Reader.slice(segment, 29, Reader.size(segment) - 29)
-        with {:ok, patches} <- XMP.gps_patches(packet), do: {:ok, shift(patches, 29)}
+    case exif_header_length(header) do
+      nil ->
+        jpeg_app1(segment, header)
 
-      {<<@extended_xmp_header, guid::binary-size(32), size::32, offset::32>>, _} ->
-        {:extended, {guid, size, offset, 75, Reader.size(segment) - 75}}
-
-      {<<@extended_xmp_header, _::binary>>, _} ->
-        {:error, :invalid_extended_xmp}
-
-      {header, _} ->
-        other_app1_patches(segment, header)
+      length ->
+        {:ok, tiff} = Reader.slice(segment, length, Reader.size(segment) - length)
+        with {:ok, patches} <- TIFF.gps_patches(tiff), do: {:ok, shift(patches, length)}
     end
   end
 
   defp jpeg_segment(_marker, _segment), do: {:ok, []}
+
+  # Like exiftool (`/^(.{0,4})Exif\0./is`): `Exif\0` in any letter case, after
+  # up to 4 bytes of garbage, and one more byte. The TIFF data follows.
+  defp exif_header_length(header) do
+    Enum.find_value(4..0//-1, fn skip ->
+      case header do
+        <<_::binary-size(skip), e, x, i, f, 0, _, _::binary>>
+        when (e ||| 0x20) == ?e and (x ||| 0x20) == ?x and (i ||| 0x20) == ?i and
+               (f ||| 0x20) == ?f ->
+          skip + 6
+
+        _ ->
+          nil
+      end
+    end)
+  end
+
+  defp jpeg_app1(segment, <<@xmp_header, _::binary>>) do
+    {:ok, packet} = Reader.slice(segment, 29, Reader.size(segment) - 29)
+    with {:ok, patches} <- XMP.gps_patches(packet), do: {:ok, shift(patches, 29)}
+  end
+
+  defp jpeg_app1(segment, <<@extended_xmp_header, guid::binary-size(32), size::32, offset::32>>),
+    do: {:extended, {guid, size, offset, 75, Reader.size(segment) - 75}}
+
+  defp jpeg_app1(_segment, <<@extended_xmp_header, _::binary>>),
+    do: {:error, :invalid_extended_xmp}
+
+  defp jpeg_app1(segment, header), do: other_app1_patches(segment, header)
 
   # exiftool also reads APP1 segments as XMP if they start with `http` or
   # `XMP\0`, or contain `<exif:` or `<?xpacket`. Scan those from the first `<`.
