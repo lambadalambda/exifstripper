@@ -4,7 +4,7 @@ Dependency-free utilities for working with EXIF and related metadata.
 
 Currently provides:
 
-- Lossless GPS stripping (no re-encode) from EXIF and XMP in JPEG, WebP, PNG, TIFF and ISO-BMFF (HEIC/AVIF). Files are processed without reading the image data into memory.
+- Lossless GPS stripping (no re-encode) from EXIF and XMP (including DJI drone positions) in JPEG, WebP, PNG, TIFF and ISO-BMFF (HEIC/AVIF). Files are processed without reading the image data into memory.
 - Description extraction from common metadata (EXIF/IPTC/XMP)
 
 ## Installation

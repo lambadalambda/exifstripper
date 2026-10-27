@@ -123,6 +123,39 @@ defmodule ExifStripper.XMPTest do
              )
   end
 
+  test "blanks DJI drone location properties and keeps other DJI properties" do
+    dji = "xmlns:drone-dji='http://www.dji.com/drone-dji/1.0/'"
+
+    location =
+      ~w(GpsLatitude GpsLongitude GpsLongtitude Latitude Longitude AbsoluteAltitude
+         RelativeAltitude LRFTargetLat LRFTargetLon LRFTargetAlt LRFTargetAbsAlt)
+
+    attributes = Enum.map_join(location, " ", &"drone-dji:#{&1}='+1.5'")
+    elements = Enum.map_join(location, "\n", &"<d:#{&1}>+1.5</d:#{&1}>")
+
+    original =
+      packet(
+        elements <> "<d:FlightYawDegree>12.5</d:FlightYawDegree>",
+        "#{dji} xmlns:d='http://www.dji.com/drone-dji/1.0/' #{attributes} " <>
+          "drone-dji:GimbalPitchDegree='-90' drone-dji:RtkStdLat='0.01' drone-dji:LRFTargetDistance='5'"
+      )
+
+    assert {:ok, result} = scrub(original)
+    refute result =~ "+1.5"
+    for name <- location, do: refute(result =~ name)
+    assert result =~ "drone-dji:GimbalPitchDegree='-90' drone-dji:RtkStdLat='0.01'"
+    assert result =~ "<d:FlightYawDegree>12.5</d:FlightYawDegree>"
+    assert result =~ "LRFTargetDistance='5'"
+
+    # Same local names in other namespaces stay.
+    assert {:ok, []} = XMP.gps_patches(packet("<dc:Latitude>1</dc:Latitude>"))
+
+    assert {:error, :unbound_xmp_prefix} =
+             XMP.gps_patches(
+               packet("<undeclared:AbsoluteAltitude>1</undeclared:AbsoluteAltitude>")
+             )
+  end
+
   test "accepts trailing NUL bytes" do
     assert {:ok, [_]} =
              XMP.gps_patches(packet("<exif:GPSLatitude>1</exif:GPSLatitude>") <> <<0, 0>>)

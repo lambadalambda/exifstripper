@@ -18,8 +18,12 @@ defmodule ExifStripper.GpsStripper do
     in place (BigTIFF is refused)
 
   XMP GPS properties are the elements and attributes in the EXIF namespace
-  (`http://ns.adobe.com/exif/1.0/`) whose names start with `GPS`. They are
-  overwritten with spaces, so no offsets change and the XMP stays well-formed.
+  (`http://ns.adobe.com/exif/1.0/`) whose names start with `GPS`, and the DJI
+  drone position and altitude properties (`http://www.dji.com/drone-dji/1.0/`:
+  `GpsLatitude`, `GpsLongitude`, `GpsLongtitude`, `Latitude`, `Longitude`,
+  `AbsoluteAltitude`, `RelativeAltitude`, `LRFTargetLat`, `LRFTargetLon`,
+  `LRFTargetAlt`, `LRFTargetAbsAlt`). They are overwritten with spaces, so no
+  offsets change and the XMP stays well-formed.
   XMP that cannot be scanned safely (for example with a DTD, unbalanced tags or
   in UTF-16) returns an error.
 

@@ -27,6 +27,46 @@ defmodule ExifStripper.XmpGpsTest do
     end
   end
 
+  @dji_location ~w(AbsoluteAltitude RelativeAltitude GPSLatitude GPSLongitude GPSLongtitude Latitude Longitude)
+
+  for ext <- ~w(jpg webp heic tiff) do
+    test "blanks DJI drone location properties in #{ext}" do
+      path = tmp_copy(fixture("dji_gps.#{unquote(ext)}"))
+      dji = fn -> exiftool(["-a", "-s", "-XMP-drone-dji:all", "-XMP-dc:all", path]) end
+      for tag <- @dji_location, do: assert(dji.() =~ tag)
+
+      assert :ok = GpsStripper.strip_gps_data(path, path)
+      tags = dji.()
+      for tag <- @dji_location, do: refute(tags =~ tag)
+      assert tags =~ "FlightYawDegree"
+      assert tags =~ "GimbalPitchDegree"
+      assert tags =~ "RtkStdLat"
+      assert tags =~ "Keep me"
+      refute xmp_tags(path) =~ "Warning"
+      assert exiftool(["-a", "-gps:all", path]) == ""
+    end
+  end
+
+  test "blanks DJI location attributes as written by drones" do
+    body =
+      packet(
+        "",
+        "xmlns:drone-dji='http://www.dji.com/drone-dji/1.0/' " <>
+          "drone-dji:AbsoluteAltitude=\"+120.5\" drone-dji:RelativeAltitude=\"+30.2\" " <>
+          "drone-dji:GpsLatitude=\"48.8\" drone-dji:GpsLongtitude=\"2.3\" " <>
+          "drone-dji:FlightYawDegree=\"12.5\""
+      )
+
+    path = tmp_file(jpeg([xmp_segment(body)]))
+    assert xmp_tags(path) =~ "GPS Longtitude"
+
+    assert :ok = GpsStripper.strip_gps_data(path, path)
+    tags = xmp_tags(path)
+    refute tags =~ "Altitude"
+    refute tags =~ "GPS"
+    assert tags =~ "Flight Yaw Degree"
+  end
+
   test "removes XMP from PNG files with the iTXt chunk" do
     path = tmp_copy(fixture("xmp_gps.png"))
     assert xmp_tags(path) =~ "GPS Latitude"

@@ -2,17 +2,26 @@
 
 defmodule ExifStripper.XMP do
   @moduledoc false
-  # Finds GPS properties in an XMP packet and returns patches that overwrite
-  # them with spaces, so that no byte offsets change and the XML stays
-  # well-formed. GPS properties are elements and attributes in the EXIF
-  # namespace whose local name starts with `GPS`. Prefixes are resolved through
-  # the xmlns declarations in scope.
+  # Finds location properties in an XMP packet and returns patches that
+  # overwrite them with spaces, so that no byte offsets change and the XML
+  # stays well-formed. Location properties are elements and attributes in the
+  # EXIF namespace whose local name starts with `GPS`, and the position and
+  # altitude properties of the DJI drone namespace. Prefixes are resolved
+  # through the xmlns declarations in scope.
   #
   # The scanner is a strict subset of XML: anything it cannot follow safely
-  # (DTDs, unbalanced tags, unbound prefixes on GPS names, UTF-16, ...) is an
-  # error, so that no GPS property can hide from it.
+  # (DTDs, unbalanced tags, unbound prefixes on location names, UTF-16, ...) is
+  # an error, so that no location property can hide from it.
 
   @root_scope %{"xml" => "http://www.w3.org/XML/1998/namespace"}
+
+  # DJI drone position and altitude (exiftool's DJI XMP table, plus the laser
+  # rangefinder target position of enterprise drones). Attitude, speeds,
+  # calibration and RTK accuracies (RtkStd*) are kept.
+  @dji_ns "http://www.dji.com/drone-dji/1.0/"
+  @dji_location ~w(GpsLatitude GpsLongitude GpsLongtitude Latitude Longitude
+                   AbsoluteAltitude RelativeAltitude
+                   LRFTargetLat LRFTargetLon LRFTargetAlt LRFTargetAbsAlt)
   @whitespace [?\s, ?\t, ?\r, ?\n]
   @name_stop [?\s, ?\t, ?\r, ?\n, ?/, ?>, ?<, ?=, ?', ?", ??, ?!]
 
@@ -183,21 +192,27 @@ defmodule ExifStripper.XMP do
   defp gps?("xmlns" <> _, _scope, :attribute), do: {:ok, false}
 
   defp gps?(name, scope, kind) do
-    case :binary.split(name, ":") do
-      [prefix, "GPS" <> _] ->
-        case Map.fetch(scope, prefix) do
-          {:ok, uri} -> {:ok, exif_namespace?(uri)}
-          :error -> {:error, :unbound_xmp_prefix}
-        end
+    {prefix, local} =
+      case :binary.split(name, ":") do
+        [prefix, local] -> {prefix, local}
+        # Unprefixed attributes are in no namespace.
+        [local] -> {if(kind == :element, do: "", else: nil), local}
+      end
 
-      # Unprefixed attributes are in no namespace.
-      ["GPS" <> _] when kind == :element ->
-        {:ok, exif_namespace?(Map.get(scope, ""))}
-
-      _ ->
-        {:ok, false}
+    cond do
+      not location_name?(local) -> {:ok, false}
+      prefix == nil -> {:ok, false}
+      Map.has_key?(scope, prefix) -> {:ok, location?(Map.fetch!(scope, prefix), local)}
+      prefix == "" -> {:ok, false}
+      true -> {:error, :unbound_xmp_prefix}
     end
   end
+
+  defp location_name?(local), do: match?("GPS" <> _, local) or local in @dji_location
+
+  defp location?(@dji_ns, local), do: local in @dji_location
+  defp location?(uri, "GPS" <> _), do: exif_namespace?(uri)
+  defp location?(_uri, _local), do: false
 
   # exiftool also reads other versions, and the Nikon NX2 form without the slash.
   defp exif_namespace?(uri),
