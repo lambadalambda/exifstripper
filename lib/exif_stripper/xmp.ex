@@ -23,6 +23,13 @@ defmodule ExifStripper.XMP do
                    AbsoluteAltitude RelativeAltitude
                    LRFTargetLat LRFTargetLon LRFTargetAlt LRFTargetAbsAlt)
   @whitespace [?\s, ?\t, ?\r, ?\n]
+
+  # Limits that keep time and memory bounded on hostile packets. Real XMP is
+  # far below them; above them, the packet is refused.
+  @max_depth 512
+  @max_attributes 4096
+  @max_namespaces 1024
+  @max_properties 1024
   @name_stop [?\s, ?\t, ?\r, ?\n, ?/, ?>, ?<, ?=, ?', ?", ??, ?!]
 
   alias ExifStripper.Reader
@@ -51,14 +58,40 @@ defmodule ExifStripper.XMP do
     if :binary.match(packet, <<0>>) != :nomatch do
       {:error, :unsupported_xmp_encoding}
     else
-      with {:ok, ranges} <- content(rest, pos, [], []) do
-        {:ok, for({pos, len} <- Enum.reverse(ranges), do: {pos, :binary.copy(" ", len)})}
+      with {:ok, {_count, ranges}} <- content(rest, pos, [], {0, []}) do
+        {:ok, for({pos, len} <- merge(packet, ranges), do: {pos, :binary.copy(" ", len)})}
       end
     end
   end
 
-  # The stack holds {name, scope, mode} for open elements; mode is :keep,
-  # :inside (within a blanked element) or {:blank, start}.
+  # Ranges arrive newest first. Ranges with only whitespace between them become
+  # one range: blanking that whitespace too changes nothing.
+  defp merge(packet, ranges) do
+    Enum.reduce(ranges, [], fn
+      {start, length}, [{next, next_length} | rest] = acc ->
+        gap = binary_part(packet, start + length, next - start - length)
+
+        if blank?(gap),
+          do: [{start, next + next_length - start} | rest],
+          else: [{start, length} | acc]
+
+      range, [] ->
+        [range]
+    end)
+  end
+
+  defp blank?(<<c, rest::binary>>) when c in @whitespace, do: blank?(rest)
+  defp blank?(rest), do: rest == <<>>
+
+  defp add_range({@max_properties, _ranges}, _start, _length),
+    do: {:error, :too_many_xmp_properties}
+
+  defp add_range({count, ranges}, start, length),
+    do: {:ok, {count + 1, [{start, length} | ranges]}}
+
+  # The stack holds {name, scope, mode, depth} for open elements; mode is
+  # :keep, :inside (within a blanked element) or {:blank, start}. The
+  # accumulator is {count, ranges}.
   defp content(rest, pos, stack, acc) do
     case :binary.match(rest, "<") do
       :nomatch ->
@@ -77,9 +110,7 @@ defmodule ExifStripper.XMP do
   end
 
   # Character data outside the root element can only be whitespace (padding).
-  defp check_text(<<c, rest::binary>>, []) when c in @whitespace, do: check_text(rest, [])
-  defp check_text(<<>>, []), do: :ok
-  defp check_text(_text, []), do: {:error, :invalid_xmp}
+  defp check_text(text, []), do: if(blank?(text), do: :ok, else: {:error, :invalid_xmp})
 
   defp check_text(_text, _stack), do: :ok
 
@@ -114,13 +145,8 @@ defmodule ExifStripper.XMP do
     with {:ok, name, rest, end_pos} <- name(rest, pos + 2),
          {rest, end_pos, _} <- skip_whitespace(rest, end_pos),
          <<">", rest::binary>> <- rest,
-         [{^name, _scope, mode} | stack] <- stack do
-      acc =
-        case mode do
-          {:blank, start} -> [{start, end_pos + 1 - start} | acc]
-          _ -> acc
-        end
-
+         [{^name, _scope, mode, _depth} | stack] <- stack,
+         {:ok, acc} <- close(mode, end_pos + 1, acc) do
       {:ok, rest, end_pos + 1, stack, acc}
     else
       {:error, _} = error -> error
@@ -129,23 +155,27 @@ defmodule ExifStripper.XMP do
   end
 
   defp markup(<<"<", rest::binary>>, pos, stack, acc) do
-    {parent_scope, parent_mode} =
+    {parent_scope, parent_mode, depth} =
       case stack do
-        [{_, scope, mode} | _] -> {scope, mode}
-        [] -> {@root_scope, :keep}
+        [{_, scope, mode, depth} | _] -> {scope, mode, depth + 1}
+        [] -> {@root_scope, :keep, 1}
       end
 
-    with {:ok, name, rest, end_pos} <- name(rest, pos + 1),
-         {:ok, attributes, self_closing?, rest, end_pos} <- attributes(rest, end_pos, []),
+    with true <- depth <= @max_depth || {:error, :xmp_too_deep},
+         {:ok, name, rest, end_pos} <- name(rest, pos + 1),
+         {:ok, attributes, self_closing?, rest, end_pos} <- attributes(rest, end_pos, [], 0),
          {:ok, scope} <- declare(attributes, parent_scope),
          {:ok, mode, acc} <- classify(name, attributes, scope, parent_mode, pos, stack, acc) do
-      cond do
-        not self_closing? -> {:ok, rest, end_pos, [{name, scope, mode} | stack], acc}
-        match?({:blank, _}, mode) -> {:ok, rest, end_pos, stack, [{pos, end_pos - pos} | acc]}
-        true -> {:ok, rest, end_pos, stack, acc}
+      if self_closing? do
+        with {:ok, acc} <- close(mode, end_pos, acc), do: {:ok, rest, end_pos, stack, acc}
+      else
+        {:ok, rest, end_pos, [{name, scope, mode, depth} | stack], acc}
       end
     end
   end
+
+  defp close({:blank, start}, end_pos, acc), do: add_range(acc, start, end_pos - start)
+  defp close(_mode, _end_pos, acc), do: {:ok, acc}
 
   defp skip_past(rest, pos, terminator, stack, acc) do
     case :binary.match(rest, terminator) do
@@ -182,7 +212,7 @@ defmodule ExifStripper.XMP do
   defp gps_attributes(attributes, scope, acc) do
     Enum.reduce_while(attributes, {:ok, acc}, fn {name, _value, start, stop}, {:ok, acc} ->
       case gps?(name, scope, :attribute) do
-        {:ok, true} -> {:cont, {:ok, [{start, stop - start} | acc]}}
+        {:ok, true} -> halt_on_error(add_range(acc, start, stop - start))
         {:ok, false} -> {:cont, {:ok, acc}}
         error -> {:halt, error}
       end
@@ -230,7 +260,18 @@ defmodule ExifStripper.XMP do
 
   # Applies xmlns declarations. Entity references in namespace names could
   # hide the EXIF namespace, so they are refused.
+  defp halt_on_error({:ok, _} = ok), do: {:cont, ok}
+  defp halt_on_error(error), do: {:halt, error}
+
   defp declare(attributes, scope) do
+    with {:ok, scope} <- do_declare(attributes, scope) do
+      if map_size(scope) > @max_namespaces,
+        do: {:error, :too_many_xmp_namespaces},
+        else: {:ok, scope}
+    end
+  end
+
+  defp do_declare(attributes, scope) do
     Enum.reduce_while(attributes, {:ok, scope}, fn {name, value, _, _}, {:ok, scope} ->
       prefix =
         case name do
@@ -253,7 +294,9 @@ defmodule ExifStripper.XMP do
   end
 
   # Returns {name, value, start, stop} per attribute, `stop` after the quote.
-  defp attributes(rest, pos, acc) do
+  defp attributes(_rest, _pos, _acc, @max_attributes), do: {:error, :too_many_xmp_attributes}
+
+  defp attributes(rest, pos, acc, count) do
     case skip_whitespace(rest, pos) do
       {<<"/>", rest::binary>>, pos, _} ->
         finish_attributes(acc, true, rest, pos + 2)
@@ -268,9 +311,8 @@ defmodule ExifStripper.XMP do
              {length, 1} <- :binary.match(rest, <<q>>),
              <<value::binary-size(length), _quote, rest::binary>> <- rest,
              :nomatch <- :binary.match(value, "<") do
-          attributes(rest, pos + 1 + length + 1, [
-            {name, value, start, pos + 1 + length + 1} | acc
-          ])
+          stop = pos + 1 + length + 1
+          attributes(rest, stop, [{name, value, start, stop} | acc], count + 1)
         else
           {:error, _} = error -> error
           _ -> {:error, :invalid_xmp_attribute}

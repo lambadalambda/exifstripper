@@ -215,10 +215,50 @@ defmodule ExifStripper.XMPTest do
     end
   end
 
+  test "refuses packets above the nesting, attribute, namespace and property limits" do
+    nest = fn depth ->
+      packet(String.duplicate("<dc:a>", depth) <> String.duplicate("</dc:a>", depth))
+    end
+
+    attrs = fn n -> packet("<dc:b " <> Enum.map_join(1..n, " ", &"dc:a#{&1}='x'") <> "/>") end
+
+    namespaces = fn n ->
+      decls = Enum.map_join(1..n, " ", &"xmlns:p#{&1}='u:#{&1}'")
+      packet("<dc:b #{decls}><dc:c xmlns:q='u'/></dc:b>")
+    end
+
+    properties = fn n ->
+      packet(Enum.map_join(1..n, "<dc:x/>", fn _ -> "<exif:GPSA>1</exif:GPSA>" end))
+    end
+
+    assert {:ok, []} = XMP.gps_patches(nest.(500))
+    assert {:error, :xmp_too_deep} = XMP.gps_patches(nest.(520))
+    assert {:ok, []} = XMP.gps_patches(attrs.(4000))
+    assert {:error, :too_many_xmp_attributes} = XMP.gps_patches(attrs.(4100))
+    assert {:ok, []} = XMP.gps_patches(namespaces.(1000))
+    assert {:error, :too_many_xmp_namespaces} = XMP.gps_patches(namespaces.(1030))
+    assert {:ok, [_ | _]} = XMP.gps_patches(properties.(1000))
+    assert {:error, :too_many_xmp_properties} = XMP.gps_patches(properties.(1030))
+  end
+
+  test "merges properties that are only separated by whitespace into one patch" do
+    original =
+      packet("""
+      <exif:GPSLatitude>1</exif:GPSLatitude>
+        <exif:GPSLongitude>2</exif:GPSLongitude>	<exif:GPSAltitude>3</exif:GPSAltitude>
+      <dc:title>Keep</dc:title>
+      """)
+
+    assert {:ok, [_]} = XMP.gps_patches(original)
+    assert {:ok, result} = scrub(original)
+    assert result =~ "<dc:title>Keep</dc:title>"
+    refute result =~ "GPS"
+  end
+
   test "handles deep nesting and many attributes without blowing up" do
-    depth = 50_000
+    depth = 500
     nested = String.duplicate("<dc:a>", depth) <> String.duplicate("</dc:a>", depth)
-    attrs = Enum.map_join(1..20_000, " ", &"dc:a#{&1}='x'")
+    attrs = Enum.map_join(1..4000, " ", &"dc:a#{&1}='x'")
     data = packet(nested <> "<dc:b #{attrs}/><exif:GPSLatitude>1</exif:GPSLatitude>")
 
     {micros, result} = :timer.tc(fn -> XMP.gps_patches(data) end)
