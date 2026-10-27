@@ -9,7 +9,8 @@ defmodule ExifStripper.GpsStripper do
   - JPEG: wipes GPS directories and values in EXIF (APP1)
   - WebP: wipes GPS directories and values in the `EXIF` RIFF chunk
   - HEIC / other ISO-BMFF images: wipes GPS directories and values in the `Exif` item
-  - PNG: removes metadata chunks (`eXIf`, `tEXt`, `zTXt`, `iTXt`)
+  - PNG: removes metadata chunks (`eXIf`, `tEXt`, `zTXt`, `iTXt`) and any data after `IEND`
+  - TIFF: wipes GPS directories and values in place (BigTIFF is refused)
 
   If no supported metadata is found, returns `:noop` and does not change the output.
   Malformed or unsafe EXIF metadata returns an error without writing the output.

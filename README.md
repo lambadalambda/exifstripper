@@ -4,7 +4,7 @@ Dependency-free utilities for working with EXIF and related metadata.
 
 Currently provides:
 
-- Lossless GPS stripping (no re-encode) for JPEG, WebP, PNG and ISO-BMFF (HEIC/AVIF)
+- Lossless GPS stripping (no re-encode) for JPEG, WebP, PNG, TIFF and ISO-BMFF (HEIC/AVIF)
 - Description extraction from common metadata (EXIF/IPTC/XMP)
 
 ## Installation
@@ -15,7 +15,7 @@ by adding `exif_stripper` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:exif_stripper, "~> 0.1.1"}
+    {:exif_stripper, "~> 0.1.2"}
   ]
 end
 ```
