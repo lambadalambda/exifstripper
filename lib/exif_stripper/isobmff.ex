@@ -2,29 +2,36 @@
 
 defmodule ExifStripper.ISOBMFF do
   @moduledoc false
-  # Shared ISO Base Media File Format (HEIC, AVIF) parsing: finds the Exif
-  # items and where they are stored in the file.
+  # Shared ISO Base Media File Format (HEIC, AVIF) parsing: finds the Exif and
+  # XMP items and where they are stored in the file.
 
   alias ExifStripper.Reader
 
-  @doc """
-  Returns the file extents of every Exif item. Fails closed on malformed
-  boxes, and on Exif items that are not stored at plain file offsets. Only
-  the top-level box headers and the `meta` box are read.
-  """
-  @spec exif_item_locations(binary() | Reader.t()) ::
-          {:ok, [{non_neg_integer(), [%{offset: integer(), length: integer()}]}]}
-          | {:error, term()}
-  def exif_item_locations(data) when is_binary(data),
-    do: exif_item_locations(Reader.from_binary(data))
+  @type extents :: [%{offset: integer(), length: integer()}]
 
-  def exif_item_locations(%Reader{} = reader) do
+  @doc "Returns the file extents of every Exif item, see `metadata_item_locations/1`."
+  @spec exif_item_locations(binary()) ::
+          {:ok, [{non_neg_integer(), extents()}]} | {:error, term()}
+  def exif_item_locations(data) when is_binary(data) do
+    with {:ok, items} <- metadata_item_locations(Reader.from_binary(data)),
+         do: {:ok, for({:exif, id, extents} <- items, do: {id, extents})}
+  end
+
+  @doc """
+  Returns the file extents of every Exif and XMP (`application/rdf+xml`) item.
+  Fails closed on malformed boxes, on metadata items that are not stored at
+  plain file offsets, and on encoded XMP items. Only the top-level box headers
+  and the `meta` box are read.
+  """
+  @spec metadata_item_locations(Reader.t()) ::
+          {:ok, [{:exif | :xmp, non_neg_integer(), extents()}]} | {:error, term()}
+  def metadata_item_locations(%Reader{} = reader) do
     with {:ok, meta_payload} <- isobmff_find_meta_payload(reader),
          {:ok, iinf_box} <- isobmff_find_child_box(meta_payload, "iinf"),
          {:ok, iloc_box} <- isobmff_find_child_box(meta_payload, "iloc"),
-         {:ok, exif_item_ids} <- isobmff_exif_item_ids(iinf_box),
+         {:ok, metadata_items} <- isobmff_metadata_items(iinf_box),
          {:ok, item_locations} <- isobmff_item_locations(iloc_box) do
-      isobmff_pick_items(item_locations, exif_item_ids)
+      isobmff_pick_items(item_locations, metadata_items)
     end
   end
 
@@ -109,13 +116,13 @@ defmodule ExifStripper.ISOBMFF do
     end
   end
 
-  defp isobmff_exif_item_ids(iinf_box) do
+  defp isobmff_metadata_items(iinf_box) do
     with {:ok, payload} <- isobmff_box_payload(iinf_box),
          <<version::8, _flags::24, rest::binary>> <- payload,
          {item_count, rest} <-
            if(version == 0, do: decode_u16_be(rest), else: decode_u32_be(rest)),
-         {:ok, ids} <- isobmff_collect_infe_exif_ids(rest, item_count, []) do
-      {:ok, Enum.reverse(ids)}
+         {:ok, items} <- isobmff_collect_infe_items(rest, item_count, []) do
+      {:ok, Enum.reverse(items)}
     else
       _ -> {:error, :invalid_iinf_box}
     end
@@ -123,14 +130,19 @@ defmodule ExifStripper.ISOBMFF do
     _ -> {:error, :invalid_iinf_box}
   end
 
-  defp isobmff_collect_infe_exif_ids(_rest, 0, acc), do: {:ok, acc}
+  defp isobmff_collect_infe_items(_rest, 0, acc), do: {:ok, acc}
 
-  defp isobmff_collect_infe_exif_ids(rest, remaining, acc) do
+  defp isobmff_collect_infe_items(rest, remaining, acc) do
     with {:ok, "infe", box_size, _header_size} <- isobmff_box_header(rest),
          <<box::binary-size(box_size), next::binary>> <- rest,
-         {:ok, item_id, item_type} <- isobmff_infe_item(box) do
-      acc = if item_type == "Exif", do: [item_id | acc], else: acc
-      isobmff_collect_infe_exif_ids(next, remaining - 1, acc)
+         {:ok, item_id, item_type, fields} <- isobmff_infe_item(box) do
+      acc =
+        case metadata_kind(item_type, fields) do
+          nil -> acc
+          kind -> [{kind, item_id} | acc]
+        end
+
+      isobmff_collect_infe_items(next, remaining - 1, acc)
     else
       _ -> {:error, :invalid_iinf_box}
     end
@@ -143,8 +155,8 @@ defmodule ExifStripper.ISOBMFF do
         2 ->
           with {item_id, rest} <- decode_u16_be(rest),
                {_protection, rest} <- decode_u16_be(rest),
-               <<item_type::binary-size(4), _::binary>> <- rest do
-            {:ok, item_id, item_type}
+               <<item_type::binary-size(4), fields::binary>> <- rest do
+            {:ok, item_id, item_type, fields}
           else
             _ -> {:error, :invalid_infe}
           end
@@ -152,8 +164,8 @@ defmodule ExifStripper.ISOBMFF do
         3 ->
           with {item_id, rest} <- decode_u32_be(rest),
                {_protection, rest} <- decode_u16_be(rest),
-               <<item_type::binary-size(4), _::binary>> <- rest do
-            {:ok, item_id, item_type}
+               <<item_type::binary-size(4), fields::binary>> <- rest do
+            {:ok, item_id, item_type, fields}
           else
             _ -> {:error, :invalid_infe}
           end
@@ -165,6 +177,20 @@ defmodule ExifStripper.ISOBMFF do
       _ -> {:error, :invalid_infe}
     end
   end
+
+  # `mime` items have null-terminated item_name, content_type and an optional
+  # content_encoding. Encoded (e.g. deflated) XMP cannot be patched in place.
+  defp metadata_kind("Exif", _fields), do: :exif
+
+  defp metadata_kind("mime", fields) do
+    case :binary.split(fields, <<0>>, [:global]) do
+      [_name, "application/rdf+xml", encoding | _] when encoding != "" -> :encoded_xmp
+      [_name, "application/rdf+xml" | _] -> :xmp
+      _ -> nil
+    end
+  end
+
+  defp metadata_kind(_type, _fields), do: nil
 
   defp isobmff_item_locations(iloc_box) do
     with {:ok, payload} <- isobmff_box_payload(iloc_box),
@@ -316,12 +342,14 @@ defmodule ExifStripper.ISOBMFF do
     )
   end
 
-  defp isobmff_pick_items(item_locations, ids) when is_map(item_locations) and is_list(ids) do
-    ids
-    |> Enum.reduce_while({:ok, []}, fn id, {:ok, acc} ->
-      case Map.get(item_locations, id, []) do
-        :unsupported -> {:halt, {:error, :unsupported_exif_location}}
-        extents -> {:cont, {:ok, [{id, extents} | acc]}}
+  defp isobmff_pick_items(item_locations, items) when is_map(item_locations) do
+    items
+    |> Enum.reduce_while({:ok, []}, fn {kind, id}, {:ok, acc} ->
+      case {kind, Map.get(item_locations, id, [])} do
+        {:encoded_xmp, _} -> {:halt, {:error, :unsupported_xmp_encoding}}
+        {:exif, :unsupported} -> {:halt, {:error, :unsupported_exif_location}}
+        {:xmp, :unsupported} -> {:halt, {:error, :unsupported_xmp_location}}
+        {kind, extents} -> {:cont, {:ok, [{kind, id, extents} | acc]}}
       end
     end)
     |> case do

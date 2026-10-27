@@ -10,9 +10,10 @@ defmodule ExifStripper.ISOBMFFTest do
 
   defp full_box(type, version, payload), do: box(type, <<version::8, 0::24, payload::binary>>)
 
-  # A minimal HEIF with one Exif item (id 1) and the given iloc payload (version 1).
-  defp heif(iloc_payload) do
-    infe = full_box("infe", 2, <<1::16, 0::16, "Exif", 0>>)
+  # A minimal HEIF with one item (id 1, Exif by default) and the given iloc
+  # payload (version 1).
+  defp heif(iloc_payload, infe \\ <<1::16, 0::16, "Exif", 0>>) do
+    infe = full_box("infe", 2, infe)
     iinf = full_box("iinf", 0, <<1::16, infe::binary>>)
     iloc = full_box("iloc", 1, iloc_payload)
     box("ftyp", "heic" <> <<0::32>> <> "mif1heic") <> full_box("meta", 0, iinf <> iloc)
@@ -56,5 +57,27 @@ defmodule ExifStripper.ISOBMFFTest do
     data = data <> :binary.copy(<<0>>, size)
 
     assert {:error, :metadata_too_large} = GpsStripper.strip_gps_data(data)
+  end
+
+  test "refuses encoded XMP items and XMP items outside plain file offsets" do
+    xmp = "<x:xmpmeta xmlns:x='adobe:ns:meta/'/>"
+
+    iloc = fn method, offset ->
+      <<0x44, 0, 1::16, 1::16, method::16, 0::16, 1::16, offset::32, byte_size(xmp)::32>>
+    end
+
+    mime = fn encoding ->
+      <<1::16, 0::16, "mime", 0, "application/rdf+xml", 0, encoding::binary, 0>>
+    end
+
+    offset = byte_size(heif(iloc.(0, 0), mime.("")))
+
+    assert :noop = GpsStripper.strip_gps_data(heif(iloc.(0, offset), mime.("")) <> xmp)
+
+    assert {:error, :unsupported_xmp_encoding} =
+             GpsStripper.strip_gps_data(heif(iloc.(0, offset), mime.("deflate")) <> xmp)
+
+    assert {:error, :unsupported_xmp_location} =
+             GpsStripper.strip_gps_data(heif(iloc.(1, 0), mime.("")) <> xmp)
   end
 end

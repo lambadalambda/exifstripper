@@ -4,7 +4,7 @@ Dependency-free utilities for working with EXIF and related metadata.
 
 Currently provides:
 
-- Lossless GPS stripping (no re-encode) for JPEG, WebP, PNG, TIFF and ISO-BMFF (HEIC/AVIF)
+- Lossless GPS stripping (no re-encode) from EXIF and XMP in JPEG, WebP, PNG, TIFF and ISO-BMFF (HEIC/AVIF). Files are processed without reading the image data into memory.
 - Description extraction from common metadata (EXIF/IPTC/XMP)
 
 ## Installation
@@ -22,11 +22,13 @@ end
 
 ## Usage
 
-Strip GPS metadata in-place:
+Strip GPS metadata in-place (returns `:ok`, `:noop` or `{:error, reason}`):
 
 ```elixir
 ExifStripper.GpsStripper.strip_gps_data("/tmp/in.jpg", "/tmp/in.jpg")
 ```
+
+Malformed metadata returns an error and leaves the output unchanged.
 
 Read a description:
 

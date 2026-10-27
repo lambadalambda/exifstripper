@@ -4,11 +4,13 @@ defmodule ExifStripper.TIFF do
   @moduledoc false
   # Finds the bytes to wipe to remove GPS data from a TIFF structure (a TIFF
   # file or an EXIF payload): GPS directories, the GPS pointer entries and all
-  # out-of-line GPS values. Patches keep every offset and length unchanged.
+  # out-of-line GPS values, plus GPS properties in XMP packets (tag 700).
+  # Patches keep every offset and length unchanged.
 
-  alias ExifStripper.Reader
+  alias ExifStripper.{Reader, XMP}
 
   @gps_ifd_tag 0x8825
+  @xmp_tag 700
 
   @type patch :: {non_neg_integer(), binary()}
 
@@ -22,23 +24,48 @@ defmodule ExifStripper.TIFF do
     end
   end
 
-  # First validate and collect ranges, then wipe.
+  # First validate and collect ranges, then wipe. XMP packets are kept ranges,
+  # so wiped GPS data cannot overlap them.
   defp gps_patches(reader, offset, endian) do
-    with {:ok, kept, wiped} <-
-           collect_ifds(reader, [{offset, :keep}], endian, MapSet.new(), [], []),
+    with {:ok, kept, wiped, xmp} <-
+           collect_ifds(reader, [{offset, :keep}], endian, MapSet.new(), [], [], []),
          kept <- merge_ranges(kept),
          wiped <- merge_ranges(wiped),
-         false <- ranges_overlap?(kept, wiped) do
-      {:ok, Enum.map(wiped, fn {pos, len} -> {pos, :binary.copy(<<0>>, len)} end)}
+         false <- ranges_overlap?(kept, wiped),
+         {:ok, xmp_patches} <- xmp_patches(reader, xmp) do
+      {:ok, Enum.map(wiped, fn {pos, len} -> {pos, :binary.copy(<<0>>, len)} end) ++ xmp_patches}
     else
       true -> {:error, :overlapping_gps_data}
       {:error, _} = error -> error
     end
   end
 
-  defp collect_ifds(_reader, [], _endian, _seen, kept, wiped), do: {:ok, [{0, 8} | kept], wiped}
+  defp xmp_patches(reader, ranges) do
+    ranges = ranges |> Enum.uniq() |> Enum.sort()
 
-  defp collect_ifds(reader, [{offset, role} | pending], endian, seen, kept, wiped) do
+    overlap? =
+      ranges
+      |> Enum.chunk_every(2, 1, :discard)
+      |> Enum.any?(fn [{start, length}, {next, _}] -> start + length > next end)
+
+    if overlap? do
+      {:error, :overlapping_xmp}
+    else
+      Enum.reduce_while(ranges, {:ok, []}, fn {start, length}, {:ok, acc} ->
+        with {:ok, packet} <- Reader.slice(reader, start, length),
+             {:ok, patches} <- XMP.gps_patches(packet) do
+          {:cont, {:ok, Enum.map(patches, fn {pos, bytes} -> {pos + start, bytes} end) ++ acc}}
+        else
+          error -> {:halt, error}
+        end
+      end)
+    end
+  end
+
+  defp collect_ifds(_reader, [], _endian, _seen, kept, wiped, xmp),
+    do: {:ok, [{0, 8} | kept], wiped, xmp}
+
+  defp collect_ifds(reader, [{offset, role} | pending], endian, seen, kept, wiped, xmp) do
     with false <- MapSet.member?(seen, offset),
          {:ok, entries, next, size} <- read_ifd(reader, offset, endian),
          {kept, wiped} <-
@@ -47,15 +74,14 @@ defmodule ExifStripper.TIFF do
              else: {[{offset, 2}, {offset + size - 4, 4} | kept], wiped}
            ),
          pending <- if(next == 0, do: pending, else: [{next, role} | pending]),
-         {:ok, pending, kept, wiped} <-
-           Enum.reduce_while(entries, {:ok, pending, kept, wiped}, fn entry,
-                                                                      {:ok, todo, keep, wipe} ->
-             case collect_entry(reader, entry, role, endian, todo, keep, wipe) do
-               {:ok, _, _, _} = result -> {:cont, result}
+         {:ok, {pending, kept, wiped, xmp}} <-
+           Enum.reduce_while(entries, {:ok, {pending, kept, wiped, xmp}}, fn entry, {:ok, acc} ->
+             case collect_entry(reader, entry, role, endian, acc) do
+               {:ok, _} = result -> {:cont, result}
                {:error, _} = error -> {:halt, error}
              end
            end) do
-      collect_ifds(reader, pending, endian, MapSet.put(seen, offset), kept, wiped)
+      collect_ifds(reader, pending, endian, MapSet.put(seen, offset), kept, wiped, xmp)
     else
       true -> {:error, :cyclic_ifd}
       {:error, _} = error -> error
@@ -77,7 +103,7 @@ defmodule ExifStripper.TIFF do
     end
   end
 
-  defp collect_entry(reader, {pos, entry}, role, endian, pending, kept, wiped) do
+  defp collect_entry(reader, {pos, entry}, role, endian, {pending, kept, wiped, xmp}) do
     <<tag::binary-size(2), type::binary-size(2), count::binary-size(4), value::binary-size(4)>> =
       entry
 
@@ -86,7 +112,7 @@ defmodule ExifStripper.TIFF do
     cond do
       role == :keep and tag == @gps_ifd_tag ->
         if type == 4 and count == 1 and value >= 8 do
-          {:ok, [{value, :wipe} | pending], kept, [{pos, 12} | wiped]}
+          {:ok, {[{value, :wipe} | pending], kept, [{pos, 12} | wiped], xmp}}
         else
           {:error, :invalid_gps_pointer}
         end
@@ -94,7 +120,7 @@ defmodule ExifStripper.TIFF do
       # Entries wiped by a previous invocation are deliberately left as padding.
       tag == 0 and type == 0 and count == 0 and value == 0 ->
         kept = if role == :keep, do: [{pos, 12} | kept], else: kept
-        {:ok, pending, kept, wiped}
+        {:ok, {pending, kept, wiped, xmp}}
 
       true ->
         with {:ok, width} <- tiff_type_size(type),
@@ -105,11 +131,12 @@ defmodule ExifStripper.TIFF do
              {:ok, pending} <-
                referenced_ifds(reader, tag, type, count, start, role, endian, pending) do
           ranges = if length > 4, do: [{start, length}], else: []
+          xmp = if role == :keep and tag == @xmp_tag, do: [{start, length} | xmp], else: xmp
 
           if role == :wipe do
-            {:ok, pending, kept, ranges ++ wiped}
+            {:ok, {pending, kept, ranges ++ wiped, xmp}}
           else
-            {:ok, pending, [{pos, 12} | ranges ++ kept], wiped}
+            {:ok, {pending, [{pos, 12} | ranges ++ kept], wiped, xmp}}
           end
         else
           _ -> {:error, :invalid_tiff_entry}

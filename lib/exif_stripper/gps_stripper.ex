@@ -2,18 +2,29 @@
 
 defmodule ExifStripper.GpsStripper do
   @moduledoc """
-  Losslessly strips GPS-related EXIF metadata, without re-encoding images.
+  Losslessly strips GPS-related EXIF and XMP metadata, without re-encoding images.
 
   Supported containers:
 
-  - JPEG: wipes GPS directories and values in EXIF (APP1)
-  - WebP: wipes GPS directories and values in the `EXIF` RIFF chunk
-  - HEIC / other ISO-BMFF images: wipes GPS directories and values in the `Exif` item
-  - PNG: removes metadata chunks (`eXIf`, `tEXt`, `zTXt`, `iTXt`) and any data after `IEND`
-  - TIFF: wipes GPS directories and values in place (BigTIFF is refused)
+  - JPEG: wipes GPS directories and values in EXIF (APP1), and GPS properties
+    in XMP and Extended XMP (APP1)
+  - WebP: wipes GPS directories and values in the `EXIF` chunk, and GPS
+    properties in the `XMP ` chunk
+  - HEIC / other ISO-BMFF images: wipes GPS directories and values in the
+    `Exif` item, and GPS properties in XMP (`application/rdf+xml`) items
+  - PNG: removes metadata chunks (`eXIf`, `tEXt`, `zTXt`, `iTXt`, which holds
+    XMP) and any data after `IEND`
+  - TIFF: wipes GPS directories and values, and GPS properties in XMP (tag 700),
+    in place (BigTIFF is refused)
+
+  XMP GPS properties are the elements and attributes in the EXIF namespace
+  (`http://ns.adobe.com/exif/1.0/`) whose names start with `GPS`. They are
+  overwritten with spaces, so no offsets change and the XMP stays well-formed.
+  XMP that cannot be scanned safely (for example with a DTD, unbalanced tags or
+  in UTF-16) returns an error.
 
   If no supported metadata is found, returns `:noop` and does not change the output.
-  Malformed or unsafe EXIF metadata returns an error without writing the output.
+  Malformed or unsafe EXIF or XMP metadata returns an error without writing the output.
 
   `strip_gps_data/2` reads only the metadata, not the image data. When input
   and output are the same file, JPEG, WebP, ISO-BMFF and TIFF files are patched
@@ -25,7 +36,7 @@ defmodule ExifStripper.GpsStripper do
 
   import Bitwise, only: [<<<: 2, &&&: 2]
 
-  alias ExifStripper.{ISOBMFF, Reader, TIFF}
+  alias ExifStripper.{ISOBMFF, Reader, TIFF, XMP}
 
   @png_signature <<0x89, "PNG", 0x0D, 0x0A, 0x1A, 0x0A>>
   @png_metadata_chunks ["eXIf", "tEXt", "zTXt", "iTXt"]
@@ -33,6 +44,9 @@ defmodule ExifStripper.GpsStripper do
   @jpg_app1_marker 0xE1
   @jpg_sos_marker 0xDA
   @jpg_tem_marker 0x01
+
+  @xmp_header "http://ns.adobe.com/xap/1.0/\0"
+  @extended_xmp_header "http://ns.adobe.com/xmp/extension/\0"
 
   @copy_block_size 65_536
 
@@ -95,7 +109,7 @@ defmodule ExifStripper.GpsStripper do
         png_plan(reader, 8, [{0, 8}], false)
 
       {<<0xFF, 0xD8, _::binary>>, reader} ->
-        patch_plan(jpeg_patches(reader, 2, []))
+        patch_plan(jpeg_patches(reader, 2, [], []))
 
       {<<"RIFF", _size::32, "WEBP">>, reader} ->
         patch_plan(webp_patches(reader, 12, []))
@@ -118,7 +132,19 @@ defmodule ExifStripper.GpsStripper do
   end
 
   defp patch_plan({:ok, []}), do: :noop
-  defp patch_plan({:ok, patches}), do: {:patch, patches}
+
+  # A safety net: overlapping patches would corrupt the output.
+  defp patch_plan({:ok, patches}) do
+    patches = Enum.sort_by(patches, &elem(&1, 0))
+
+    overlap? =
+      patches
+      |> Enum.chunk_every(2, 1, :discard)
+      |> Enum.any?(fn [{pos, bytes}, {next, _}] -> pos + byte_size(bytes) > next end)
+
+    if overlap?, do: {:error, :overlapping_patches}, else: {:patch, patches}
+  end
+
   defp patch_plan({:error, _} = error), do: error
 
   ## PNG
@@ -155,31 +181,32 @@ defmodule ExifStripper.GpsStripper do
 
   ## JPEG
 
-  defp jpeg_patches(reader, pos, acc) do
+  # Extended XMP chunks are collected, then patched once all are known.
+  defp jpeg_patches(reader, pos, acc, extended) do
     case Reader.peek(reader, pos, 4) do
       {<<>>, _reader} ->
-        {:ok, acc}
+        extended_xmp_patches(reader, extended, acc)
 
       {<<0xFF, @jpg_sos_marker, _::binary>>, _reader} ->
-        {:ok, acc}
+        extended_xmp_patches(reader, extended, acc)
 
       {<<0xFF, 0xFF, _::binary>>, reader} ->
-        jpeg_patches(reader, pos + 1, acc)
+        jpeg_patches(reader, pos + 1, acc, extended)
 
       {<<0xFF, marker, _::binary>>, reader}
       when marker == @jpg_tem_marker or marker in 0xD0..0xD9 ->
-        jpeg_patches(reader, pos + 2, acc)
+        jpeg_patches(reader, pos + 2, acc, extended)
 
       {<<0xFF, marker, length::16>>, reader} when length >= 2 ->
         start = pos + 4
+        next = start + length - 2
 
-        case Reader.slice(reader, start, length - 2) do
-          {:ok, segment} ->
-            with {:ok, patches} <- jpeg_segment_patches(marker, segment),
-                 do: jpeg_patches(reader, start + length - 2, shift(patches, start) ++ acc)
-
-          {:error, _} ->
-            {:error, :invalid_jpeg}
+        with {:ok, segment} <- slice(reader, start, length - 2, :invalid_jpeg) do
+          case jpeg_segment(marker, segment) do
+            {:ok, patches} -> jpeg_patches(reader, next, shift(patches, start) ++ acc, extended)
+            {:extended, chunk} -> jpeg_patches(reader, next, acc, [{start, chunk} | extended])
+            error -> error
+          end
         end
 
       _ ->
@@ -187,14 +214,56 @@ defmodule ExifStripper.GpsStripper do
     end
   end
 
-  defp jpeg_segment_patches(@jpg_app1_marker, segment) do
-    case Reader.peek(segment, 0, 6) do
-      {<<"Exif", 0, 0>>, _} -> exif_payload_patches(segment)
-      _ -> {:ok, []}
+  defp jpeg_segment(@jpg_app1_marker, segment) do
+    case Reader.peek(segment, 0, 75) do
+      {<<"Exif", 0, 0, _::binary>>, _} ->
+        exif_payload_patches(segment)
+
+      {<<@xmp_header, _::binary>>, _} ->
+        {:ok, packet} = Reader.slice(segment, 29, Reader.size(segment) - 29)
+        with {:ok, patches} <- XMP.gps_patches(packet), do: {:ok, shift(patches, 29)}
+
+      {<<@extended_xmp_header, guid::binary-size(32), size::32, offset::32>>, _} ->
+        {:extended, {guid, size, offset, 75, Reader.size(segment) - 75}}
+
+      {<<@extended_xmp_header, _::binary>>, _} ->
+        {:error, :invalid_extended_xmp}
+
+      _ ->
+        {:ok, []}
     end
   end
 
-  defp jpeg_segment_patches(_marker, _segment), do: {:ok, []}
+  defp jpeg_segment(_marker, _segment), do: {:ok, []}
+
+  # Each Extended XMP packet (by GUID) must be complete: chunks of one size,
+  # without gaps or overlaps. Patches are mapped back onto the chunks.
+  defp extended_xmp_patches(reader, extended, acc) do
+    extended
+    |> Enum.group_by(fn {_start, {guid, _, _, _, _}} -> guid end)
+    |> Enum.reduce_while({:ok, acc}, fn {_guid, chunks}, {:ok, acc} ->
+      chunks = Enum.sort_by(chunks, fn {_start, {_, _, offset, _, _}} -> offset end)
+      [{_, {_, size, _, _, _}} | _] = chunks
+
+      {complete?, total} =
+        Enum.reduce(chunks, {true, 0}, fn {_, {_, chunk_size, offset, _, length}}, {ok?, pos} ->
+          {ok? and chunk_size == size and offset == pos, pos + length}
+        end)
+
+      extents =
+        for {start, {_, _, _, skip, length}} <- chunks,
+            do: %{offset: start + skip, length: length}
+
+      with true <- complete? and total == size,
+           {:ok, packet} <- read_extents(reader, extents),
+           {:ok, patches} <- XMP.gps_patches(packet) do
+        {:cont, {:ok, to_physical(patches, extents, 0, acc)}}
+      else
+        false -> {:halt, {:error, :invalid_extended_xmp}}
+        error -> {:halt, error}
+      end
+    end)
+  end
 
   ## WebP
 
@@ -210,8 +279,7 @@ defmodule ExifStripper.GpsStripper do
         {:ok, chunk} = Reader.slice(reader, start, length)
         padding = if rem(length, 2) == 1 and remaining - 8 > length, do: 1, else: 0
 
-        with {:ok, patches} <-
-               if(type == "EXIF", do: exif_payload_patches(chunk), else: {:ok, []}) do
+        with {:ok, patches} <- webp_chunk_patches(type, chunk) do
           webp_patches(reader, start + length + padding, shift(patches, start) ++ acc)
         end
 
@@ -219,6 +287,10 @@ defmodule ExifStripper.GpsStripper do
         {:error, :invalid_webp}
     end
   end
+
+  defp webp_chunk_patches("EXIF", chunk), do: exif_payload_patches(chunk)
+  defp webp_chunk_patches("XMP ", chunk), do: XMP.gps_patches(chunk)
+  defp webp_chunk_patches(_type, _chunk), do: {:ok, []}
 
   # An EXIF payload is a TIFF structure, optionally after an `Exif\0\0` header.
   defp exif_payload_patches(reader) do
@@ -235,11 +307,11 @@ defmodule ExifStripper.GpsStripper do
   ## ISO-BMFF
 
   defp isobmff_patches(reader) do
-    with {:ok, items} <- ISOBMFF.exif_item_locations(reader),
+    with {:ok, items} <- ISOBMFF.metadata_item_locations(reader),
          :ok <- validate_extents(reader, items) do
-      Enum.reduce_while(items, {:ok, []}, fn {_id, extents}, {:ok, acc} ->
+      Enum.reduce_while(items, {:ok, []}, fn {kind, _id, extents}, {:ok, acc} ->
         with {:ok, item} <- read_extents(reader, extents),
-             {:ok, patches} <- heif_exif_item_patches(item) do
+             {:ok, patches} <- heif_item_patches(kind, item) do
           {:cont, {:ok, to_physical(patches, extents, 0, acc)}}
         else
           {:error, _} = error -> {:halt, error}
@@ -251,11 +323,11 @@ defmodule ExifStripper.GpsStripper do
   # Whole-item replacements must never read backwards into unsanitized bytes.
   # Check all physical ranges together, including aliases across different IDs.
   defp validate_extents(reader, items) do
-    extents = Enum.flat_map(items, &elem(&1, 1))
+    extents = Enum.flat_map(items, &elem(&1, 2))
     size = Reader.size(reader)
 
     valid? =
-      Enum.all?(items, fn {_id, extents} -> extents != [] end) and
+      Enum.all?(items, fn {_kind, _id, extents} -> extents != [] end) and
         Enum.all?(extents, fn %{offset: o, length: l} -> o >= 0 and l > 0 and o + l <= size end)
 
     overlap? =
@@ -290,7 +362,9 @@ defmodule ExifStripper.GpsStripper do
     end
   end
 
-  defp heif_exif_item_patches(<<tiff_offset::32-big, rest::binary>> = item)
+  defp heif_item_patches(:xmp, item), do: XMP.gps_patches(item)
+
+  defp heif_item_patches(:exif, <<tiff_offset::32-big, rest::binary>> = item)
        when byte_size(rest) >= tiff_offset do
     start = 4 + tiff_offset
     {:ok, tiff} = Reader.slice(Reader.from_binary(item), start, byte_size(item) - start)
@@ -301,7 +375,7 @@ defmodule ExifStripper.GpsStripper do
     end
   end
 
-  defp heif_exif_item_patches(_), do: {:error, :invalid_exif_item}
+  defp heif_item_patches(:exif, _item), do: {:error, :invalid_exif_item}
 
   # Maps sorted, disjoint patches within an item onto its physical extents.
   defp to_physical([], _extents, _logical, acc), do: acc
@@ -325,13 +399,15 @@ defmodule ExifStripper.GpsStripper do
 
   ## Helpers
 
+  defp slice(reader, offset, length, error) do
+    with {:error, _} <- Reader.slice(reader, offset, length), do: {:error, error}
+  end
+
   defp shift(patches, by), do: Enum.map(patches, fn {pos, bytes} -> {pos + by, bytes} end)
 
   defp apply_patches(data, patches) do
     {iodata, pos} =
-      patches
-      |> Enum.sort_by(&elem(&1, 0))
-      |> Enum.reduce({[], 0}, fn {offset, bytes}, {acc, pos} ->
+      Enum.reduce(patches, {[], 0}, fn {offset, bytes}, {acc, pos} ->
         {[acc, binary_part(data, pos, offset - pos), bytes], offset + byte_size(bytes)}
       end)
 
